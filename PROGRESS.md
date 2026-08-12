@@ -42,7 +42,7 @@ checklist, as work progresses.
 |-------|-------|-------------|--------|
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 7, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below). `train_ds`/`val_ds`/`test_ds` built successfully: 17150/1885/2588 windows. Dark-degradation visual check ran without error. Pose parsing intentionally deferred (see TODOs). |
-| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **In progress.** Two design decisions locked in 2026-08-13: (1) "DarkIR-lite" (width_multiplier 0.5) = the official **DarkIR-m** checkpoint (width=32) — real pretrained-weight fine-tuning, not a from-scratch architecture; (2) loss starts as **L1 only**, PSNR/SSIM logged as metrics, VGG/FFT perceptual loss deferred. External resources confirmed live: GitHub `cidautai/DarkIR` (MIT), HuggingFace `Cidaut/DarkIR`. `src/darkir_lite/` still empty — exploration notebook next, before writing the training script, to confirm DarkIR's actual loading code (mirrors Phase 1's probe-first approach). |
+| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **In progress — DarkIR loading fully confirmed, training code not yet written.** Exploration kernel `endoslam-phase2a-darkir-explore` v3 `COMPLETE` on Kaggle 2026-08-13: model instantiates at 3,321,638 params (matches official DarkIR-m's ~3.31M), checkpoint `DarkIR_384.pt` loads with **0 missing / 0 unexpected keys**, forward pass on a real EndoSLAM frame works end-to-end (`[1,3,320,320]` in and out). See "DarkIR loading — confirmed facts" below for exact API. `src/darkir_lite/` still empty — next is `model.py` + `train.py` against these confirmed facts. |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | Not started. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
@@ -64,14 +64,43 @@ a single flat sequence — no specimen/trajectory split. `Cameras/` also has
 `Calibration/` sibling per camera (not a sequence, correctly excluded by
 the `{organ}-*` glob).
 
+## DarkIR loading — confirmed facts (2026-08-13, exploration kernel v3)
+
+Found via local clone inspection of `github.com/cidautai/DarkIR` (MIT) and
+empirically verified on Kaggle (see log evidence above):
+
+- **Class**: `archs.DarkIR.DarkIR(nn.Module)`. Constructor:
+  `__init__(self, img_channel=3, width=32, middle_blk_num_enc=2,
+  middle_blk_num_dec=2, enc_blk_nums=[1,2,3], dec_blk_nums=[3,1,1],
+  dilations=[1,4,9], extra_depth_wise=True)` — defaults already match the
+  DarkIR-m config, so `DarkIR(width=32)` alone is correct.
+- **Import gotcha**: `archs/__init__.py` does `from ptflops import
+  get_model_complexity_info` at module level — importing anything from
+  `archs` (even just `DarkIR`) requires `ptflops` installed first, or it
+  fails with `ModuleNotFoundError`, not an isolated failure.
+- **Checkpoint**: HuggingFace `Cidaut/DarkIR` hosts exactly one file,
+  `DarkIR_384.pt`, confirmed via `options/test/LOLBlur.yml` to be the
+  width=32 variant. Download via
+  `huggingface_hub.hf_hub_download(repo_id="Cidaut/DarkIR", filename="DarkIR_384.pt")`.
+- **Checkpoint format**: `torch.load(path)['params']` is the raw state
+  dict — no "module." DDP prefix needed for a single-GPU (non-distributed)
+  load, unlike the repo's own `load_model()` helpers which assume DDP.
+- **Input convention**: plain `[0,1]` float RGB, `(B,3,H,W)`, no extra
+  mean/std normalization (PIL + `ToTensor()` in their `inference.py`) —
+  matches `dark_degradation.py`'s convention already. Output shape equals
+  input shape (restoration model, not a classifier/encoder).
+- **Their `archs/__init__.py`** also has reusable `load_weights()`,
+  `resume_model()`, `save_checkpoint()` helpers (all DDP-oriented) —
+  `train.py` can adapt the *pattern* (checkpoint dict shape: `epoch`,
+  `model_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`) but
+  should skip the DDP wrapping entirely for a single Kaggle GPU.
+
 ## Immediate next steps
 
-1. Author `notebooks/phase2a_explore/phase2a_darkir_explore.ipynb` (GPU
-   off) to confirm DarkIR-m's real constructor signature, checkpoint
-   filename, and input convention against the actual cloned repo — don't
-   write the training script against guesses.
-2. Once confirmed: implement `src/darkir_lite/model.py` + `train.py`,
-   smoke-test on Kaggle (GPU on, short run) before committing to the full
+1. Implement `src/darkir_lite/model.py` (thin wrapper around the above)
+   and `train.py` (training loop against `flatten_for_enhancement()` +
+   `dark_degradation.py`, L1 loss, PSNR/SSIM logging, checkpointing).
+2. Smoke-test on Kaggle (GPU on, short run) before committing to the full
    20-epoch fine-tune.
 3. Before Phase 3 (which needs real pose values): implement pose parsing
    for the `.xlsx` files — see TODOs below.
@@ -130,3 +159,15 @@ the `{organ}-*` glob).
   start. Fixed `config.yaml`'s checkpoint casing (`cidaut` -> `Cidaut`)
   and documented the width decision inline. No training code written yet
   — next is the exploration notebook to confirm DarkIR's real loading API.
+- 2026-08-13: Ran the DarkIR exploration notebook. v1 completed but its
+  architecture-loading cells were silently skipped (`archs/__init__.py`
+  imports `ptflops` at module level, not installed, broke the whole
+  import chain). Cloned the DarkIR repo locally to inspect source
+  directly instead of iterating blind on Kaggle — found the exact
+  constructor signature, checkpoint key (`'params'`), and the
+  `DarkIR_384.pt` = width=32 mapping (via `options/test/LOLBlur.yml`).
+  v2 fixed the ptflops install but crashed on a cosmetic bug (`ptflops`
+  has no `__version__`). v3 fixed that and completed cleanly: 3,321,638
+  params, checkpoint loads with 0 missing/0 unexpected keys, forward pass
+  works on both a dummy tensor and a real EndoSLAM frame. See "DarkIR
+  loading — confirmed facts" above. **Ready to write `model.py`/`train.py`.**
