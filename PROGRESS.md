@@ -42,7 +42,7 @@ checklist, as work progresses.
 |-------|-------|-------------|--------|
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 7, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below). `train_ds`/`val_ds`/`test_ds` built successfully: 17150/1885/2588 windows. Dark-degradation visual check ran without error. Pose parsing intentionally deferred (see TODOs). |
-| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | Not started. |
+| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **In progress.** Two design decisions locked in 2026-08-13: (1) "DarkIR-lite" (width_multiplier 0.5) = the official **DarkIR-m** checkpoint (width=32) — real pretrained-weight fine-tuning, not a from-scratch architecture; (2) loss starts as **L1 only**, PSNR/SSIM logged as metrics, VGG/FFT perceptual loss deferred. External resources confirmed live: GitHub `cidautai/DarkIR` (MIT), HuggingFace `Cidaut/DarkIR`. `src/darkir_lite/` still empty — exploration notebook next, before writing the training script, to confirm DarkIR's actual loading code (mirrors Phase 1's probe-first approach). |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | Not started. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
@@ -66,8 +66,14 @@ the `{organ}-*` glob).
 
 ## Immediate next steps
 
-1. Start Phase 2 (DarkIR-lite fine-tuning) whenever ready.
-2. Before Phase 3 (which needs real pose values): implement pose parsing
+1. Author `notebooks/phase2a_explore/phase2a_darkir_explore.ipynb` (GPU
+   off) to confirm DarkIR-m's real constructor signature, checkpoint
+   filename, and input convention against the actual cloned repo — don't
+   write the training script against guesses.
+2. Once confirmed: implement `src/darkir_lite/model.py` + `train.py`,
+   smoke-test on Kaggle (GPU on, short run) before committing to the full
+   20-epoch fine-tune.
+3. Before Phase 3 (which needs real pose values): implement pose parsing
    for the `.xlsx` files — see TODOs below.
 
 ## Known open TODOs in code (not yet resolved)
@@ -117,3 +123,10 @@ the `{organ}-*` glob).
   Kernel `endoslam-phase1-validation` version 7 completed successfully:
   17150/1885/2588 train/val/test windows, dark-degradation check passed.
   **Phase 1 is validated.**
+- 2026-08-13: Started Phase 2 planning. Researched DarkIR (CVPR 2025) —
+  confirmed live GitHub (`cidautai/DarkIR`, MIT) and HuggingFace
+  (`Cidaut/DarkIR`) repos. Decided `width_multiplier: 0.5` = official
+  DarkIR-m checkpoint (real pretrained fine-tuning) and L1-only loss to
+  start. Fixed `config.yaml`'s checkpoint casing (`cidaut` -> `Cidaut`)
+  and documented the width decision inline. No training code written yet
+  — next is the exploration notebook to confirm DarkIR's real loading API.

@@ -22,8 +22,11 @@ dark_degradation:
   apply_to: ["UnityCam", "HighCam", "LowCam"]
 
 darkir_lite:
-  pretrained_checkpoint: "cidaut/DarkIR"  # fine-tune from official CVPR25 weights
-  width_multiplier: 0.5    # shrink channel count vs official DarkIR
+  pretrained_checkpoint: "Cidaut/DarkIR"  # HF slug (case-sensitive) -- fine-tune from official CVPR25 weights
+  width_multiplier: 0.5    # 0.5x DarkIR-l (width=64) lands exactly on the official
+                            # DarkIR-m checkpoint (width=32, 3.31M params) -- "DarkIR-lite"
+                            # IS DarkIR-m, real pretrained-weight fine-tuning, not a custom
+                            # from-scratch architecture. See PROGRESS.md Phase 2 notes.
   freeze_encoder_epochs: 3 # freeze pretrained encoder for first N epochs, then unfreeze
   batch_size: 8
   lr: 1e-4
