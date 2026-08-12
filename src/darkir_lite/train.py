@@ -82,10 +82,16 @@ def build_dataloaders(config: dict):
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: str) -> tuple[float, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: str, max_batches: int | None = None) -> tuple[float, float]:
+    """max_batches caps how much of the validation set gets evaluated --
+    important for --max-steps smoke tests, where running the full val set
+    (hundreds of batches) after only a handful of training steps defeats
+    the point of a *short* smoke test, especially on a CPU fallback."""
     model.eval()
     psnrs, ssims = [], []
-    for dark, clean in loader:
+    for i, (dark, clean) in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
         dark, clean = dark.to(device), clean.to(device)
         pred = model(dark).clamp(0.0, 1.0)
         pred_np = pred.cpu().numpy()
@@ -186,7 +192,11 @@ def train(config: dict, output_dir: str, resume_from: str | None = None, max_ste
                 break
 
         avg_loss = epoch_loss / max(1, len(train_loader))
-        val_psnr, val_ssim = evaluate(model, val_loader, device)
+        # smoke tests (max_steps set) only need a handful of val batches to
+        # confirm the eval path works and produces sane (non-NaN) numbers --
+        # not the full validation set, which can dwarf the training time itself
+        val_max_batches = 5 if max_steps else None
+        val_psnr, val_ssim = evaluate(model, val_loader, device, max_batches=val_max_batches)
         print(f"epoch {epoch}: train_loss={avg_loss:.4f} val_psnr={val_psnr:.2f} val_ssim={val_ssim:.4f}")
 
         epoch_path = os.path.join(output_dir, f"epoch_{epoch}.pt")
