@@ -1,0 +1,49 @@
+# One config to rule out "which subset am I even using" confusion across
+# Kaggle sessions. Edit paths per-environment; everything else should be
+# stable across the whole project.
+
+data:
+  root: "/kaggle/input/endoslam"   # change to your Colab mount path if needed
+  organ: "stomach"                 # only stomach in scope for this project
+  synthetic_cam: "UnityCam"        # has paired depth + pose GT
+  real_cams: ["HighCam", "LowCam"] # pose GT only, real ex-vivo footage
+  image_size: [320, 320]           # match UnityCam native res; downsample real cams to match
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  seed: 42
+
+dark_degradation:
+  # Synthetic dark-frame formation model, y = gamma * (x conv k) + n
+  # (same formulation DarkIR itself is trained against)
+  gamma_range: [0.15, 0.4]     # illumination attenuation
+  blur_kernel_range: [3, 9]    # simulated motion/defocus blur, odd sizes only
+  noise_std_range: [0.01, 0.05]
+  apply_to: ["UnityCam", "HighCam", "LowCam"]
+
+darkir_lite:
+  pretrained_checkpoint: "cidaut/DarkIR"  # fine-tune from official CVPR25 weights
+  width_multiplier: 0.5    # shrink channel count vs official DarkIR
+  freeze_encoder_epochs: 3 # freeze pretrained encoder for first N epochs, then unfreeze
+  batch_size: 8
+  lr: 1e-4
+  epochs: 20
+  checkpoint_every_steps: 200   # Kaggle sessions die without warning -- save often
+
+reconstruction:
+  context_window: 8        # frames of local pose-reference window (vs LingBot-Map's full trajectory memory)
+  backbone: "mobilenet_v3_small"
+  depth_head_channels: 64
+  batch_size: 4
+  lr: 2e-4
+  epochs: 40
+  checkpoint_every_steps: 200
+
+fusion:
+  voxel_downsample: 0.002  # meters, for Open3D point cloud downsampling
+  depth_trunc: 0.15        # meters, discard depth beyond this (endoscope-scale, not room-scale)
+
+eval:
+  pose_metrics: ["ATE", "RPE"]
+  depth_metrics: ["AbsRel", "RMSE", "delta1"]
+  compare_conditions: ["raw_dark_input", "darkir_lite_enhanced"]

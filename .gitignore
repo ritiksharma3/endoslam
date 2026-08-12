@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# local venvs
+.venv/
+venv/
+
+# data (never commit dataset contents; Kaggle mounts it, don't mirror it here)
+/data/
+*.ckpt
+*.pth
+checkpoints/
+
+# outputs
+outputs/
+*.log

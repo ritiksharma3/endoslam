@@ -1,0 +1,10 @@
+# Kaggle/Colab already ship torch + CUDA -- do not pip install torch there,
+# you'll break the preinstalled CUDA build. Only add what's missing.
+opencv-python-headless>=4.9
+open3d>=0.18
+einops
+pyyaml
+tqdm
+scikit-image
+matplotlib
+tensorboard
