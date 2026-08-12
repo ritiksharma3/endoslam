@@ -20,10 +20,9 @@ checklist, as work progresses.
   Kaggle — e.g. patching `_index_sequences()` once the real folder
   layout is known — must be copied back into local `src/` and committed
   here, not left stranded in a Kaggle notebook edit.
-- **GitHub remote**: not yet set up (deliberate — deferred until the
-  user is ready to run on Kaggle, since `git clone` from a notebook
-  needs a pushable remote). Add one before running
-  `phase1_data_validation.ipynb` for real.
+- **GitHub remote**: `https://github.com/ritiksharma3/endoslam.git`
+  (`origin`, branch `main`). `phase1_data_validation.ipynb`'s `REPO_URL`
+  is already filled in with this — it's runnable on Kaggle as-is.
 
 ## Phase status
 
@@ -38,17 +37,13 @@ checklist, as work progresses.
 
 ## Immediate next steps
 
-1. Write `notebooks/phase1_data_validation.ipynb`:
-   - `os.walk("/kaggle/input/endoslam")` inspection cell (see docstring
-     in `src/data/endoslam_dataset.py`) to find the real folder layout.
-   - Patch `_index_sequences()` (and `_load_poses()`'s column-count
-     assumption) to match, then copy the patch back to local `src/` and
-     commit.
-   - Dataset-loader smoke test: sequence/window counts, batch shapes,
-     confirm `has_depth` is only `True` for UnityCam.
-   - Dark-degradation before/after visual check on real frames.
-2. Before running that notebook on Kaggle: add a GitHub remote and push
-   (currently deferred — see above).
+1. **User action required**: run `notebooks/phase1_data_validation.ipynb`
+   on Kaggle (attach the `mcocoz/endoslam` dataset, run top to bottom).
+   The notebook clones this repo itself now that `REPO_URL` is filled in.
+2. If the CHECKPOINT cell reveals `_index_sequences()` / `_load_poses()`
+   need patching (likely), patch them in the Kaggle clone, verify the
+   smoke test passes, then copy the fix back to local `src/` and commit
+   here — don't leave the real fix stranded in the Kaggle notebook.
 3. Once Phase 1 is validated end-to-end, start Phase 2 (DarkIR-lite
    fine-tuning).
 
@@ -73,3 +68,6 @@ checklist, as work progresses.
   silently excluding the two source files from the first commit — fixed
   to `/data/`). Made the initial commit (11 files). User chose to keep
   the repo local-only for now rather than push to GitHub immediately.
+- 2026-08-12: Added GitHub remote (`ritiksharma3/endoslam`, private),
+  pushed `main`. Filled in `phase1_data_validation.ipynb`'s `REPO_URL`
+  so it's runnable as-is. Next action is the user's: run it on Kaggle.
