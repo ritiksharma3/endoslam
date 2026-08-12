@@ -1,24 +1,35 @@
 """
 EndoSLAM stomach-subset dataset loader.
 
-TODO before trusting this: the official repo's directory tree is shown as an
-image (imgs/datatree.png) rather than documented in text, and the Kaggle
-mirror may organize files differently. The FIRST thing to do in Kaggle is:
+Real layout, confirmed against the Kaggle mirror (mcocoz/endoslam) via
+os.walk on 2026-08-13 -- very different from the originally-assumed
+{organ}/{camera}/{sequence}/frames pattern:
 
-    import os
-    for root, dirs, files in os.walk("/kaggle/input/endoslam"):
-        print(root, dirs[:5], files[:5])
-        if root.count(os.sep) > 4: break  # don't flood output
+    {root}/Cameras/{HighCam,LowCam}/Stomach-{I,II,III}/TumorfreeTrajectory_{1-4}/Frames/*.jpg
+    {root}/Cameras/{HighCam,LowCam}/Stomach-{I,II,III}/TumorfreeTrajectory_{1-4}/Poses/*.xlsx
+    {root}/UnityCam/Stomach/Frames/*
+    {root}/UnityCam/Stomach/Pixelwise Depths/*
+    {root}/UnityCam/Stomach/Poses/*
 
-...and adjust `_index_sequences()` below to match what you actually see.
-Everything else in this file is written to be easy to patch once the real
-folder names are known -- the path-guessing logic is isolated in one method.
+Real cameras (HighCam/LowCam) nest under Cameras/ with per-specimen organ
+folders (Stomach-I/II/III) and 4 trajectories each; the synthetic UnityCam
+sits at the top level as a single flat sequence (no specimen/trajectory
+split). Also note: on newer Kaggle kernels the dataset mount itself can be
+nested under an extra layer (e.g. /kaggle/input/datasets/<owner>/<slug>)
+instead of the classic /kaggle/input/<slug> -- see find_endoslam_root() in
+the validation notebook.
 
-Expected GT formats (per the EndoSLAM paper):
-- Pose: 6-DoF (position + orientation) per frame, time-synchronized, for
-  UnityCam, HighCam, LowCam.
-- Depth: per-pixel depth maps, UnityCam (synthetic) only. HighCam/LowCam
-  have NO depth GT -- don't compute depth loss/metrics against them.
+Pose TODO (deliberately deferred, not blocking Phase 1): real-camera poses
+turned out to be one .xlsx per trajectory (e.g.
+"low_high_pose_stom2_teste2_low_images.xlsx"), not the assumed pose.txt --
+column layout unconfirmed. UnityCam's Poses/ format is also unconfirmed.
+Parsing is deferred until a phase that actually needs pose values (Phase 3);
+until then FrameSample.pose is always None and __getitem__ zero-fills it.
+
+Depth: per-pixel depth maps exist only under UnityCam/Stomach/Pixelwise Depths/
+-- HighCam/LowCam have no depth GT, matching the paper. Depth-to-frame
+pairing is by sorted position (index i in Frames <-> index i in Pixelwise
+Depths), not matching filenames -- the two dirs don't share a naming scheme.
 """
 
 import os
@@ -35,7 +46,7 @@ from torch.utils.data import Dataset
 @dataclass
 class FrameSample:
     image_path: str
-    pose: np.ndarray | None      # (4,4) or (6,) depending on how GT is stored -- confirm on first inspection
+    pose: np.ndarray | None      # always None for now -- pose parsing deferred, see module docstring
     depth_path: str | None       # None for HighCam/LowCam
     camera: str                  # "UnityCam" | "HighCam" | "LowCam"
     sequence_id: str
@@ -63,54 +74,70 @@ class EndoSLAMStomachDataset(Dataset):
         self.windows = self._build_windows()
 
     def _index_sequences(self) -> dict:
-        """
-        PATCH THIS after inspecting the real folder layout. Placeholder
-        assumes a structure like:
-            {root}/{organ}/{camera}/{sequence_name}/frames/*.png (or .jpg)
-            {root}/{organ}/{camera}/{sequence_name}/pose.txt
-            {root}/{organ}/{camera}/{sequence_name}/depth/*.png   (UnityCam only)
-        which mirrors how the paper describes per-sub-dataset organization.
-        Adjust glob patterns once confirmed.
-        """
+        """See the module docstring for the confirmed real folder layout."""
+        organ_name = self.organ.capitalize()  # config has "stomach" -> real folders are "Stomach*"
         sequences = {}
         for cam in self.cameras:
-            cam_dir = os.path.join(self.root, self.organ, cam)
-            if not os.path.isdir(cam_dir):
-                print(f"[WARN] expected camera dir not found: {cam_dir} -- "
-                      f"check config.data.root and run the os.walk snippet in the module docstring")
-                continue
-            for seq_dir in sorted(glob.glob(os.path.join(cam_dir, "*"))):
-                if not os.path.isdir(seq_dir):
-                    continue
-                seq_id = f"{cam}/{os.path.basename(seq_dir)}"
-                frame_paths = sorted(
-                    glob.glob(os.path.join(seq_dir, "frames", "*.png"))
-                    + glob.glob(os.path.join(seq_dir, "frames", "*.jpg"))
-                )
-                pose_file = os.path.join(seq_dir, "pose.txt")
-                poses = self._load_poses(pose_file) if os.path.isfile(pose_file) else None
-                depth_dir = os.path.join(seq_dir, "depth")
-                has_depth = cam == "UnityCam" and os.path.isdir(depth_dir)
+            if cam == "UnityCam":
+                self._index_unitycam(organ_name, sequences)
+            else:
+                self._index_real_camera(cam, organ_name, sequences)
+        return sequences
 
-                samples = []
-                for i, fp in enumerate(frame_paths):
-                    depth_path = None
-                    if has_depth:
-                        candidate = os.path.join(depth_dir, os.path.basename(fp))
-                        depth_path = candidate if os.path.isfile(candidate) else None
-                    pose = poses[i] if poses is not None and i < len(poses) else None
-                    samples.append(FrameSample(fp, pose, depth_path, cam, seq_id, i))
+    def _index_real_camera(self, cam: str, organ_name: str, sequences: dict) -> None:
+        cam_dir = os.path.join(self.root, "Cameras", cam)
+        if not os.path.isdir(cam_dir):
+            print(f"[WARN] expected camera dir not found: {cam_dir}")
+            return
+        for organ_dir in sorted(glob.glob(os.path.join(cam_dir, f"{organ_name}-*"))):
+            if not os.path.isdir(organ_dir):
+                continue
+            for traj_dir in sorted(glob.glob(os.path.join(organ_dir, "TumorfreeTrajectory_*"))):
+                if not os.path.isdir(traj_dir):
+                    continue
+                seq_id = f"{cam}/{os.path.basename(organ_dir)}/{os.path.basename(traj_dir)}"
+                frame_paths = sorted(
+                    glob.glob(os.path.join(traj_dir, "Frames", "*.jpg"))
+                    + glob.glob(os.path.join(traj_dir, "Frames", "*.png"))
+                )
+                # pose: real cams store one .xlsx per trajectory under Poses/ --
+                # parsing deferred, see module docstring. depth: no GT for real cams.
+                samples = [
+                    FrameSample(fp, None, None, cam, seq_id, i)
+                    for i, fp in enumerate(frame_paths)
+                ]
                 if samples:
                     sequences[seq_id] = samples
-        return sequences
+
+    def _index_unitycam(self, organ_name: str, sequences: dict) -> None:
+        organ_dir = os.path.join(self.root, "UnityCam", organ_name)
+        if not os.path.isdir(organ_dir):
+            print(f"[WARN] expected UnityCam organ dir not found: {organ_dir}")
+            return
+        seq_id = f"UnityCam/{organ_name}"
+        frame_paths = sorted(
+            glob.glob(os.path.join(organ_dir, "Frames", "*.png"))
+            + glob.glob(os.path.join(organ_dir, "Frames", "*.jpg"))
+        )
+        depth_dir = os.path.join(organ_dir, "Pixelwise Depths")
+        # paired by sorted position, not filename -- Frames/ and Pixelwise Depths/
+        # don't share a naming scheme (see module docstring)
+        depth_paths = sorted(glob.glob(os.path.join(depth_dir, "*"))) if os.path.isdir(depth_dir) else []
+        samples = []
+        for i, fp in enumerate(frame_paths):
+            depth_path = depth_paths[i] if i < len(depth_paths) else None
+            samples.append(FrameSample(fp, None, depth_path, "UnityCam", seq_id, i))
+        if samples:
+            sequences[seq_id] = samples
 
     @staticmethod
     def _load_poses(pose_file: str) -> np.ndarray:
-        # Placeholder: assumes whitespace-separated 6 or 7 values per line
-        # (tx ty tz + quaternion or euler). Confirm the actual column count
-        # and convention (camera-to-world vs world-to-camera) against the
-        # paper's supplementary material before trusting any pose numbers.
-        return np.loadtxt(pose_file)
+        # Not wired up yet -- real-camera poses are .xlsx (one per trajectory,
+        # e.g. "low_high_pose_stom2_teste2_low_images.xlsx"), not the originally
+        # assumed pose.txt. Column layout unconfirmed; UnityCam's Poses/ format
+        # is also unconfirmed. Deferred until a phase that actually needs pose
+        # values -- see module docstring.
+        raise NotImplementedError("pose parsing not yet implemented -- see module docstring")
 
     def _apply_split(self, train_split: float, val_split: float, seed: int):
         seq_ids = sorted(self.sequences.keys())
