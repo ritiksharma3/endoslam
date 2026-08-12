@@ -29,7 +29,7 @@ darkir_lite:
                             # from-scratch architecture. See PROGRESS.md Phase 2 notes.
   freeze_encoder_epochs: 3 # freeze pretrained encoder for first N epochs, then unfreeze
   batch_size: 8
-  lr: 1e-4
+  lr: 1.0e-4  # PyYAML parses bare "1e-4" as a string, not a float -- needs the decimal point
   epochs: 20
   checkpoint_every_steps: 200   # Kaggle sessions die without warning -- save often
 
@@ -38,7 +38,7 @@ reconstruction:
   backbone: "mobilenet_v3_small"
   depth_head_channels: 64
   batch_size: 4
-  lr: 2e-4
+  lr: 2.0e-4  # same PyYAML bare-exponent gotcha as darkir_lite.lr above
   epochs: 40
   checkpoint_every_steps: 200
 

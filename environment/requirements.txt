@@ -8,3 +8,5 @@ tqdm
 scikit-image
 matplotlib
 tensorboard
+ptflops  # required to import anything from DarkIR's archs/ package (archs/__init__.py
+         # imports it at module level) -- confirmed missing on Kaggle's base image
