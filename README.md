@@ -39,7 +39,5 @@ If Phase 3 runs long, cut here first: shorter context window (4 frames
 instead of 8), smaller backbone, fewer epochs -- not the eval or the report.
 
 ## Status
-- [x] Phase 0: repo scaffold, config, requirements
-- [x] Phase 1 (partial): dataset loader + dark-degradation module (needs
-      validation against real downloaded folder structure -- see TODOs)
-- [ ] Phase 2 onward: not started
+
+See `PROGRESS.md` for current phase status, open TODOs, and next steps.
