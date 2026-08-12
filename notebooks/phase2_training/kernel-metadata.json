@@ -1,0 +1,13 @@
+{
+  "id": "ritiksharma8/endoslam-phase2-darkir-training",
+  "title": "endoslam-phase2-darkir-training",
+  "code_file": "phase2_darkir_training.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["mcocoz/endoslam"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
