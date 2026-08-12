@@ -42,7 +42,7 @@ checklist, as work progresses.
 |-------|-------|-------------|--------|
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 7, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below). `train_ds`/`val_ds`/`test_ds` built successfully: 17150/1885/2588 windows. Dark-degradation visual check ran without error. Pose parsing intentionally deferred (see TODOs). |
-| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **In progress — DarkIR loading fully confirmed, training code not yet written.** Exploration kernel `endoslam-phase2a-darkir-explore` v3 `COMPLETE` on Kaggle 2026-08-13: model instantiates at 3,321,638 params (matches official DarkIR-m's ~3.31M), checkpoint `DarkIR_384.pt` loads with **0 missing / 0 unexpected keys**, forward pass on a real EndoSLAM frame works end-to-end (`[1,3,320,320]` in and out). See "DarkIR loading — confirmed facts" below for exact API. `src/darkir_lite/` still empty — next is `model.py` + `train.py` against these confirmed facts. |
+| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Pipeline implemented and smoke-tested on Kaggle.** `src/darkir_lite/model.py` + `train.py` written against facts confirmed in exploration kernel v3, validated locally (real DarkIR repo + real checkpoint + synthetic frames), then smoke-tested for real: kernel `endoslam-phase2-darkir-training` v5 `COMPLETE` 2026-08-13, `--max-steps 20` — **train_loss=0.0007, val_psnr=23.68, val_ssim=0.772**, checkpoint saved and reloadable. Ran on CPU (see "GPU compatibility issue" below) — **full 20-epoch run needs a working GPU path first, that's the next action, not yet done.** |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | Not started. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
@@ -95,14 +95,40 @@ empirically verified on Kaggle (see log evidence above):
   `model_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`) but
   should skip the DDP wrapping entirely for a single Kaggle GPU.
 
+## GPU compatibility issue (2026-08-13, blocks the real training run)
+
+Kaggle kernels pushed via the API with `enable_gpu: true` default to a
+**Tesla P100** (compute capability 6.0, Pascal) — and Kaggle's preinstalled
+torch build (2.10.0) ships **no Pascal kernels at all**. `torch.cuda.is_available()`
+returns `True` (a driver is present) but every real op raises `CUDA error:
+no kernel image is available for execution on the device`. This is a known,
+documented Kaggle/PyTorch issue, not a bug in our code — see
+[Kaggle product feedback #664303](https://www.kaggle.com/product-feedback/664303).
+
+Tried `kaggle kernels push --accelerator nvidiaTeslaT4` to request a T4
+instead — Kaggle still assigned a P100 (the exact accelerator enum strings
+aren't documented, and/or T4 capacity wasn't available). Rather than keep
+guessing, `train.py::_select_device()` now does a real tiny op on `cuda`
+before trusting it and falls back to CPU on failure — this is what let the
+smoke test complete instead of crashing, but **CPU is only viable for a
+20-step smoke test, not the real 20-epoch run** (2162 steps/epoch — the
+smoke test's 20 steps + a 5-batch val check already took ~10 minutes on
+CPU). Options for the real run, not yet decided:
+1. Keep retrying pushes hoping for a T4 assignment (unreliable).
+2. Find the correct `--accelerator` string for T4 (current guess didn't work).
+3. Install a Pascal-compatible torch build on Kaggle (deviates from the
+   project's "never touch preinstalled torch" rule, but arguably justified
+   since the preinstalled build is incompatible with the hardware Kaggle
+   actually assigns here).
+4. Fall back to Google Colab for this phase (README already names it as
+   a fallback platform for exactly this kind of quota/compatibility issue).
+
 ## Immediate next steps
 
-1. Implement `src/darkir_lite/model.py` (thin wrapper around the above)
-   and `train.py` (training loop against `flatten_for_enhancement()` +
-   `dark_degradation.py`, L1 loss, PSNR/SSIM logging, checkpointing).
-2. Smoke-test on Kaggle (GPU on, short run) before committing to the full
-   20-epoch fine-tune.
-3. Before Phase 3 (which needs real pose values): implement pose parsing
+1. Decide and implement a real GPU path (see options above), then run the
+   full 20-epoch fine-tune — `--max-steps` removed/raised, real training
+   time and final PSNR/SSIM to report.
+2. Before Phase 3 (which needs real pose values): implement pose parsing
    for the `.xlsx` files — see TODOs below.
 
 ## Known open TODOs in code (not yet resolved)
@@ -171,3 +197,26 @@ empirically verified on Kaggle (see log evidence above):
   params, checkpoint loads with 0 missing/0 unexpected keys, forward pass
   works on both a dummy tensor and a real EndoSLAM frame. See "DarkIR
   loading — confirmed facts" above. **Ready to write `model.py`/`train.py`.**
+- 2026-08-13: Implemented `src/darkir_lite/model.py` + `train.py`. Found
+  and fixed a real bug via local testing (torch is available on this
+  machine): `config.yaml`'s `lr: 1e-4`/`2e-4` were parsed as *strings* by
+  PyYAML, not floats (its float regex requires a decimal point in the
+  mantissa) — fixed to `1.0e-4`/`2.0e-4`. Fully validated locally against
+  the real cloned DarkIR repo, the real HF checkpoint, and synthetic
+  frames: checkpoint loading, freeze/unfreeze gradient behavior, forward
+  pass at EndoSLAM resolution and at a non-multiple-of-8 resolution,
+  dataset wrapping, eval metrics, and the full train/checkpoint/resume
+  cycle. Added `ptflops` to `requirements.txt` (confirmed missing on
+  Kaggle's base image, required just to import DarkIR's `archs/`).
+- 2026-08-13: Ran the training notebook (GPU on, `--max-steps 20` smoke
+  test) — first GPU-enabled kernel in this project. Hit the P100/no-Pascal-
+  kernels issue (see "GPU compatibility issue" above) twice, including a
+  failed attempt to force a T4 via `--accelerator`. Added a real-op device
+  check with CPU fallback instead of chasing the accelerator string
+  further. First CPU run technically worked but took 40+ minutes because
+  `evaluate()` ran the *full* 238-batch validation set regardless of
+  `--max-steps` — fixed to cap validation at 5 batches during smoke tests.
+  Re-ran: kernel `endoslam-phase2-darkir-training` v5 `COMPLETE` in ~10 min
+  on CPU — train_loss=0.0007, val_psnr=23.68, val_ssim=0.772, checkpoint
+  saved and reloadable. **Pipeline is smoke-tested end-to-end.** Full
+  20-epoch run still needs a real GPU path (CPU is far too slow for it).
