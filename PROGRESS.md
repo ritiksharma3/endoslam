@@ -137,26 +137,86 @@ one Kaggle session. The notebook checks for
 doesn't reach epoch 19, the latest `epoch_*.pt` gets downloaded and
 committed to that path, then the notebook re-pushed to continue.
 
+## Pose format — confirmed facts (2026-08-13, `phase3a_pose_explore` kernel v1)
+
+Nobody had ever opened a real pose file before this kernel — both formats
+were guesses. Real facts, from `kaggle kernels output
+ritiksharma8/endoslam-phase3a-pose-explore`:
+
+- **Real-camera poses** (`Cameras/{cam}/Stomach-*/TumorfreeTrajectory_*/Poses/*.xlsx`,
+  one file per trajectory, confirmed — not per-frame): single sheet
+  (`Sheet1`), columns `Unnamed: 0, ImageFrame, Pose_Index, trans_x, trans_y,
+  trans_z, quot_x, quot_y, quot_z, quot_w`. Quaternion (`quot_*`) +
+  translation (`trans_*`) representation — manually verified unit quaternion
+  (norm ≈ 1.000007 on row 0: `0.08517² + 0.98372² + (-0.108621)² +
+  0.115055² ≈ 1`). Translation magnitudes ~0.18–0.45 — consistent with
+  meters at endoscope scale (matches `fusion.depth_trunc: 0.15`).
+  **Row count does not reliably equal frame count**: HighCam/Stomach-I/
+  Trajectory_1 had 1094 pose rows vs. 1092 frames (mismatch), while
+  LowCam/Stomach-II/Trajectory_2 (30 vs 30) and HighCam/Stomach-III/
+  Trajectory_3 (749 vs 749) matched exactly. **`ImageFrame` does not start
+  at 0** (min=60 for Trajectory_1, up to max=1770) — it's the original
+  video frame index, not a 0-based row position. Frame filenames confirmed
+  via `kaggle datasets files` as `frame_{N:06d}.jpg` (e.g.
+  `frame_000741.jpg`) — **`ImageFrame` matches the zero-padded number in
+  the filename directly**, so real-camera pose/frame alignment must be by
+  parsing that number from the filename and joining on `ImageFrame`, NOT
+  by positional/row order (positional order happened to work for 2 of 3
+  sampled trajectories only by coincidence of no dropped frames).
+- **UnityCam poses**: NOT `.xlsx` — a single
+  `UnityCam/Stomach/Poses/stomach_position_rotation.csv` for the whole
+  sequence. Columns: `tX, tY, tZ, rX, rY, rZ, rW, time(s)`. Also
+  quaternion+translation, but **no frame-index/name column at all** — only
+  a `time(s)` column incrementing by ~0.0333334s (~30fps). Translation
+  magnitudes are much larger (e.g. `tX=0.66, tY=8.98, tZ=-3.13`) than
+  real-camera poses — different scale/coordinate system (Unity world
+  units, not endoscope-scale meters) — **do not assume the same units or
+  coordinate convention as real-camera poses without an explicit
+  conversion**. Row count vs. frame count: 1544 rows vs. 1548 frames (and
+  1548 depth maps) — a small mismatch, and with no alignment column
+  available, positional truncate-to-min is the only option here (unlike
+  real cams, which have `ImageFrame` to align by).
+
 ## Immediate next steps
 
-1. Phase 3: implement pose parsing for the `.xlsx` files (real-camera and
-   UnityCam formats) — see TODOs below. This is the current blocker.
+1. Phase 3: implement `_load_poses()` against the confirmed formats above
+   — real-camera loader joins on `ImageFrame` (parsed from both the xlsx
+   column and the `frame_NNNNNN.jpg` filename), UnityCam loader truncates
+   positionally to `min(frame_count, pose_row_count)` since there's no
+   alignment key. **Done** — see the Log entry below.
+2. Write the Mini-3D-Recon model itself (backbone/pose-head/training loop)
+   — deliberately out of scope for the loader work above.
 
 ## Known open TODOs in code (not yet resolved)
 
-- **Pose parsing not implemented.** Real-camera poses are one `.xlsx` per
-  trajectory (e.g. `low_high_pose_stom2_teste2_low_images.xlsx`); UnityCam's
-  `Poses/` format is also unconfirmed. `FrameSample.pose` is always `None`
-  right now and `__getitem__` zero-fills it — fine for Phase 1/2 (frames
-  only), **must be fixed before Phase 3** (pose-based training).
+- **Pose parsing**: implemented — `_load_real_camera_poses()` and
+  `_load_unitycam_poses()` in `src/data/endoslam_dataset.py`, validated
+  locally against the real downloaded sample files (not just the kernel
+  log's `.describe()` summary). One more real-data wrinkle found only by
+  testing against the actual file: the UnityCam CSV's last row is a
+  partial write (`NaN` in `rY/rZ/rW/time(s)`) — `scipy.spatial.transform.
+  Rotation.from_quat` raises on a zero/NaN-derived quaternion, so the
+  loader now drops NaN rows explicitly, with a loud warning if a dropped
+  row isn't confined to the tail (which would silently shift positional
+  frame alignment for every row after it — didn't happen on the real
+  file, but the loader guards for it since a future dataset version
+  could).
+- **Coordinate-frame/handedness between real-camera and UnityCam poses is
+  still unconfirmed.** Both use quaternion+translation, but UnityCam's
+  translation scale is clearly different (Unity world units vs. real-cam's
+  apparent meters) and Unity itself is left-handed/Y-up — whether the
+  real-camera tracking system uses the same convention isn't something
+  column inspection alone can settle. Flagged for Phase 3 model design,
+  not blocking the loader itself (loader just needs to parse each source
+  into its own SE(3) matrix; cross-source alignment is a training-time
+  concern).
 - **Split imbalance risk**: `_apply_split()` splits by *sequence*, and
   UnityCam is only 1 sequence out of 25 total (vs. 24 real-camera
-  sequences). With an 80/10/10 split it can land entirely in train, val,
-  *or* test depending on the shuffle seed — meaning val/test could end up
-  with zero depth-GT samples. Not an issue for Phase 1 (structural
-  validation only), but worth a deliberate fix (e.g. force UnityCam into
-  every split, or split within UnityCam by frame ranges) before Phase 3
-  needs UnityCam's depth+pose GT for quantitative eval across all splits.
+  sequences). **Fixed 2026-08-13** — UnityCam is now sliced positionally by
+  the same train/val/test fractions within its own frame range instead of
+  being treated as one atomic sequence, so every split gets a share of it.
+  Verified locally against a synthetic fixture (disjoint, ordered slices
+  covering the full range in all three splits).
 
 ## Log
 
@@ -243,3 +303,27 @@ committed to that path, then the notebook re-pushed to continue.
   Decided not to commit the final checkpoint into the repo — it'll be
   re-fetched from Kaggle kernel output whenever Phase 3/4 need it.
   **Phase 2 is fully done.** Next: pose parsing for Phase 3.
+- 2026-08-13: Fixed the `_apply_split()` UnityCam imbalance risk (real-cam
+  sequences keep the original whole-sequence shuffle; UnityCam now sliced
+  positionally within its own frame range so every split gets a share),
+  verified locally against a synthetic fixture. Ran the `phase3a_explore`
+  kernel (v1, `COMPLETE`) to inspect real pose files for the first time —
+  see "Pose format — confirmed facts" above. Implemented
+  `_load_real_camera_poses()` (joins on `ImageFrame`, parsed from the xlsx
+  and from `frame_NNNNNN.jpg` filenames) and `_load_unitycam_poses()`
+  (positional, truncated to the shorter of frame/pose counts), normalizing
+  both to `(4,4)` SE(3) matrices. Downloaded one real `.xlsx` and the real
+  UnityCam `.csv` locally (`kaggle datasets download -f <path>`) to
+  validate end-to-end rather than trusting the kernel log's summary stats
+  alone — this caught a real bug the log didn't show: the UnityCam CSV's
+  last row is a partial write (`NaN` in `rY/rZ/rW/time(s)`), which crashed
+  `scipy`'s quaternion conversion until the loader added an explicit
+  NaN-row drop (safe here since it's confined to the tail). Both loaders
+  now validated against real data: valid SE(3) matrices (orthonormal
+  rotation, correct bottom row), UnityCam's first translation matches the
+  kernel log exactly (`[0.66, 8.98, -3.13]`). **Pose-parsing blocker for
+  Phase 3 is resolved.** Kaggle-only validation (real 25-sequence dataset,
+  full `_index_real_camera()`/`_index_unitycam()` run, `__getitem__`
+  end-to-end) still pending — next step per the plan is extending
+  `phase1_data_validation.ipynb` with pose/split assertion cells. Mini-3D-
+  Recon model design itself (backbone/pose-head/training loop) not started.

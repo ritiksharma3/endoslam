@@ -19,12 +19,35 @@ nested under an extra layer (e.g. /kaggle/input/datasets/<owner>/<slug>)
 instead of the classic /kaggle/input/<slug> -- see find_endoslam_root() in
 the validation notebook.
 
-Pose TODO (deliberately deferred, not blocking Phase 1): real-camera poses
-turned out to be one .xlsx per trajectory (e.g.
-"low_high_pose_stom2_teste2_low_images.xlsx"), not the assumed pose.txt --
-column layout unconfirmed. UnityCam's Poses/ format is also unconfirmed.
-Parsing is deferred until a phase that actually needs pose values (Phase 3);
-until then FrameSample.pose is always None and __getitem__ zero-fills it.
+Pose format, confirmed 2026-08-13 via the phase3a_pose_explore Kaggle kernel
+(see PROGRESS.md "Pose format -- confirmed facts" for the full findings) --
+nobody had opened a real pose file before that kernel, both formats below
+were guesses until then:
+
+- Real-camera poses: one .xlsx per trajectory (e.g.
+  "low_high_pose_stom2_teste2_low_images.xlsx"), single sheet, columns
+  ImageFrame/Pose_Index/trans_x/trans_y/trans_z/quot_x/quot_y/quot_z/quot_w
+  (quaternion + translation, meters). Row count does NOT reliably equal
+  frame count, and ImageFrame is NOT a 0-based row position -- it's the
+  original video frame index, and matches the zero-padded number in each
+  frame's filename (frame_NNNNNN.jpg) exactly. Alignment is therefore by
+  parsing that number and joining on ImageFrame, not positional order.
+- UnityCam poses: NOT .xlsx -- a single
+  UnityCam/Stomach/Poses/stomach_position_rotation.csv for the whole
+  sequence, columns tX/tY/tZ/rX/rY/rZ/rW/time(s) (quaternion + translation,
+  but in Unity world units -- a different scale than real-camera poses, do
+  not assume the same coordinate convention). No frame-index/name column
+  exists, so alignment here is positional (row i <-> frame i), truncated to
+  min(frame_count, pose_row_count) since the two counts don't quite match
+  (1544 rows vs 1548 frames in the sampled sequence). The real file's very
+  last row is also a partial write (NaNs in rY/rZ/rW/time(s)) -- dropped by
+  _load_unitycam_poses() since it's confined to the tail and so can't shift
+  positional alignment for any earlier row.
+
+Internal representation, once loaded: a 4x4 SE(3) matrix (float32) per
+frame, regardless of source format -- matches eval.pose_metrics (ATE/RPE
+are conventionally computed on SE(3)) and keeps rotation-representation
+differences between the two camera types out of downstream code.
 
 Depth: per-pixel depth maps exist only under UnityCam/Stomach/Pixelwise Depths/
 -- HighCam/LowCam have no depth GT, matching the paper. Depth-to-frame
@@ -33,20 +56,33 @@ Depths), not matching filenames -- the two dirs don't share a naming scheme.
 """
 
 import os
+import re
 import glob
 import random
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import cv2
 import torch
+from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
+
+_FRAME_NUMBER_RE = re.compile(r"(\d+)")
+
+
+def _pose_matrix(translation: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
+    """translation: (3,), quat_xyzw: (4,) in [x, y, z, w] order -> (4, 4) SE(3) matrix."""
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = Rotation.from_quat(quat_xyzw).as_matrix()
+    mat[:3, 3] = translation
+    return mat
 
 
 @dataclass
 class FrameSample:
     image_path: str
-    pose: np.ndarray | None      # always None for now -- pose parsing deferred, see module docstring
+    pose: np.ndarray | None      # (4, 4) SE(3) matrix; None only if the frame had no matching pose row
     depth_path: str | None       # None for HighCam/LowCam
     camera: str                  # "UnityCam" | "HighCam" | "LowCam"
     sequence_id: str
@@ -101,12 +137,25 @@ class EndoSLAMStomachDataset(Dataset):
                     glob.glob(os.path.join(traj_dir, "Frames", "*.jpg"))
                     + glob.glob(os.path.join(traj_dir, "Frames", "*.png"))
                 )
-                # pose: real cams store one .xlsx per trajectory under Poses/ --
-                # parsing deferred, see module docstring. depth: no GT for real cams.
-                samples = [
-                    FrameSample(fp, None, None, cam, seq_id, i)
-                    for i, fp in enumerate(frame_paths)
-                ]
+                pose_files = glob.glob(os.path.join(traj_dir, "Poses", "*.xlsx"))
+                poses_by_frame = self._load_real_camera_poses(pose_files[0]) if pose_files else {}
+                if not poses_by_frame:
+                    print(f"[WARN] no pose file found under {traj_dir}/Poses -- sequence dropped")
+                    continue
+
+                samples = []
+                dropped = 0
+                for i, fp in enumerate(frame_paths):
+                    m = _FRAME_NUMBER_RE.search(os.path.basename(fp))
+                    frame_num = int(m.group(1)) if m else None
+                    pose = poses_by_frame.get(frame_num) if frame_num is not None else None
+                    if pose is None:
+                        dropped += 1
+                        continue
+                    samples.append(FrameSample(fp, pose, None, cam, seq_id, i))
+                if dropped:
+                    print(f"[WARN] {seq_id}: {dropped}/{len(frame_paths)} frames had no matching "
+                          f"pose row (by ImageFrame) and were dropped")
                 if samples:
                     sequences[seq_id] = samples
 
@@ -124,21 +173,70 @@ class EndoSLAMStomachDataset(Dataset):
         # paired by sorted position, not filename -- Frames/ and Pixelwise Depths/
         # don't share a naming scheme (see module docstring)
         depth_paths = sorted(glob.glob(os.path.join(depth_dir, "*"))) if os.path.isdir(depth_dir) else []
+
+        pose_dir = os.path.join(organ_dir, "Poses")
+        pose_files = glob.glob(os.path.join(pose_dir, "*.csv"))
+        poses = self._load_unitycam_poses(pose_files[0]) if pose_files else np.empty((0, 4, 4), dtype=np.float32)
+        if len(poses) == 0:
+            print(f"[WARN] no pose file found under {pose_dir} -- sequence dropped")
+            return
+
+        # UnityCam's pose CSV has no frame-index/name column (see module
+        # docstring) -- alignment is positional only. Truncate frames/depths/
+        # poses to the shortest of the three rather than letting poses fall
+        # back to None mid-sequence: pose supervision in Phase 3 needs pose
+        # GT to be non-optional per frame it trains on, unlike depth (which
+        # already has a has_depth opt-out below).
+        n = min(len(frame_paths), len(poses))
+        if n < len(frame_paths):
+            print(f"[WARN] {seq_id}: {len(frame_paths)} frames but only {len(poses)} pose rows "
+                  f"-- truncating to {n}")
         samples = []
-        for i, fp in enumerate(frame_paths):
+        for i in range(n):
             depth_path = depth_paths[i] if i < len(depth_paths) else None
-            samples.append(FrameSample(fp, None, depth_path, "UnityCam", seq_id, i))
+            samples.append(FrameSample(frame_paths[i], poses[i], depth_path, "UnityCam", seq_id, i))
         if samples:
             sequences[seq_id] = samples
 
     @staticmethod
-    def _load_poses(pose_file: str) -> np.ndarray:
-        # Not wired up yet -- real-camera poses are .xlsx (one per trajectory,
-        # e.g. "low_high_pose_stom2_teste2_low_images.xlsx"), not the originally
-        # assumed pose.txt. Column layout unconfirmed; UnityCam's Poses/ format
-        # is also unconfirmed. Deferred until a phase that actually needs pose
-        # values -- see module docstring.
-        raise NotImplementedError("pose parsing not yet implemented -- see module docstring")
+    def _load_real_camera_poses(pose_file: str) -> dict[int, np.ndarray]:
+        """{ImageFrame -> 4x4 SE(3) matrix}, keyed by the same frame number encoded
+        in each frame's filename (frame_NNNNNN.jpg) -- see module docstring."""
+        df = pd.read_excel(pose_file)
+        t = df[["trans_x", "trans_y", "trans_z"]].to_numpy(dtype=np.float32)
+        q = df[["quot_x", "quot_y", "quot_z", "quot_w"]].to_numpy(dtype=np.float32)
+        frame_nums = df["ImageFrame"].to_numpy(dtype=np.int64)
+        return {
+            int(frame_nums[i]): _pose_matrix(t[i], q[i])
+            for i in range(len(df))
+        }
+
+    @staticmethod
+    def _load_unitycam_poses(pose_file: str) -> np.ndarray:
+        """(N, 4, 4) SE(3) matrices in file row order -- no alignment key exists,
+        caller must pair positionally against sorted frame paths."""
+        cols = ["tX", "tY", "tZ", "rX", "rY", "rZ", "rW"]
+        df = pd.read_csv(pose_file)
+        n_before = len(df)
+        # Confirmed on the real file: its last row is a partial write (NaNs in
+        # rY/rZ/rW/time(s)), presumably truncated logging -- dropping only
+        # trailing NaN rows is positionally safe since it can't shift the
+        # index of any earlier row. A NaN row anywhere else WOULD break the
+        # positional row<->frame pairing, so flag loudly rather than silently
+        # drop mid-sequence.
+        nan_rows = df[cols].isna().any(axis=1)
+        if nan_rows.any():
+            bad_idx = df.index[nan_rows]
+            if list(bad_idx) != list(range(n_before - len(bad_idx), n_before)):
+                print(f"[WARN] {pose_file}: NaN pose row(s) NOT confined to the tail "
+                      f"({list(bad_idx)}) -- dropping them will shift positional "
+                      f"frame alignment for everything after the first bad row")
+            df = df.dropna(subset=cols)
+            print(f"[WARN] {pose_file}: dropped {n_before - len(df)}/{n_before} row(s) "
+                  f"with NaN pose values")
+        t = df[["tX", "tY", "tZ"]].to_numpy(dtype=np.float32)
+        q = df[["rX", "rY", "rZ", "rW"]].to_numpy(dtype=np.float32)
+        return np.stack([_pose_matrix(t[i], q[i]) for i in range(len(df))]) if len(df) else np.empty((0, 4, 4), dtype=np.float32)
 
     def _apply_split(self, train_split: float, val_split: float, seed: int):
         # UnityCam is the ONLY sequence with depth+pose GT (1 of 25 total
@@ -208,12 +306,12 @@ class EndoSLAMStomachDataset(Dataset):
                 depths.append(torch.zeros(self.image_size))
                 has_depth_flags.append(False)
 
-            poses.append(torch.from_numpy(s.pose).float() if s.pose is not None else torch.zeros(6))
+            poses.append(torch.from_numpy(s.pose).float() if s.pose is not None else torch.eye(4))
 
         return {
             "images": torch.stack(imgs),                      # (T, 3, H, W)
             "depths": torch.stack(depths),                     # (T, H, W) -- ignore where has_depth is False
-            "poses": torch.stack(poses),                       # (T, 6 or 4x4) -- confirm format
+            "poses": torch.stack(poses),                       # (T, 4, 4) -- SE(3) camera pose matrices
             "has_depth": torch.tensor(has_depth_flags),
             "camera": window[0].camera,
             "sequence_id": window[0].sequence_id,
