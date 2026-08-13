@@ -53,6 +53,23 @@ Depth: per-pixel depth maps exist only under UnityCam/Stomach/Pixelwise Depths/
 -- HighCam/LowCam have no depth GT, matching the paper. Depth-to-frame
 pairing is by sorted position (index i in Frames <-> index i in Pixelwise
 Depths), not matching filenames -- the two dirs don't share a naming scheme.
+
+Depth format, confirmed 2026-08-13 via the phase3b_depth_explore Kaggle
+kernel: files are 8-bit 4-channel (RGBA) PNGs (e.g. "aov_image_0000.png",
+"AOV" = Arbitrary Output Variable, a render-engine term), all four channels
+identical -- __getitem__ takes channel 0 only. Values observed in [1, 72]
+(not spanning the full 0-255 range) -- absolute units/scale are NOT
+confirmed (no official EndoSLAM documentation found describing the
+Unity depth-export encoding; a "raw millimeters" hypothesis is physically
+plausible for stomach endoscopy working distances and is consistent with
+config.yaml's fusion.depth_trunc: 0.15m, but is unverified). This is fine
+for Phase 3 training: the official EndoSLAM repo's own eval_depth.py
+applies median-ratio scaling between predicted and GT depth before
+computing AbsRel/RMSE/delta1, meaning the reference methodology already
+treats predicted-vs-GT depth as scale-ambiguous rather than assuming a
+known absolute unit -- so Phase 3 trains directly against the raw pixel
+values with a plain masked loss, and true-metric calibration (if ever
+needed) is a Phase 4 fusion-time concern, not a Phase 3 training-time one.
 """
 
 import os
@@ -299,6 +316,12 @@ class EndoSLAMStomachDataset(Dataset):
 
             if s.depth_path is not None:
                 d = cv2.imread(s.depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+                # UnityCam depth PNGs are 8-bit 4-channel (RGBA) with all four
+                # channels identical (confirmed via phase3b_explore, 2026-08-13)
+                # -- a naive imread/resize keeps 4 channels, silently producing
+                # (H,W,4) instead of the documented (T,H,W); take one channel.
+                if d.ndim == 3:
+                    d = d[..., 0]
                 d = cv2.resize(d, self.image_size, interpolation=cv2.INTER_NEAREST)
                 depths.append(torch.from_numpy(d))
                 has_depth_flags.append(True)

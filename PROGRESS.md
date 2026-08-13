@@ -177,6 +177,51 @@ ritiksharma8/endoslam-phase3a-pose-explore`:
   available, positional truncate-to-min is the only option here (unlike
   real cams, which have `ImageFrame` to align by).
 
+## Depth format — confirmed facts (2026-08-13, `phase3b_depth_explore` kernel v1)
+
+`_index_unitycam()` globbed `Pixelwise Depths/*` with no extension filter
+and read it via `cv2.imread(..., IMREAD_UNCHANGED)` — nobody had ever
+checked this data's format. Real facts, from `kaggle kernels output
+ritiksharma8/endoslam-phase3b-depth-explore`:
+
+- **File format**: `.png`, 8-bit, **4-channel (RGBA)** — e.g.
+  `aov_image_0000.png` ("AOV" = Arbitrary Output Variable, a render-engine
+  term for an auxiliary render pass). All four channels are identical
+  (sample row: `[10 10 10 10]` repeated) — a single scalar replicated for
+  display, not a multi-channel precision-packing scheme.
+- **Value range**: observed `min=1, max=72` across 6 frames sampled across
+  the whole sequence (not spanning the full 0-255 range) — clearly not
+  meters (would need mm-level precision at this scale) and not obviously
+  any other standard unit either.
+- **Absolute units are NOT confirmed.** Searched the official EndoSLAM
+  repo (`github.com/CapsuleEndoscope/EndoSLAM`) and its README/eval code —
+  no documented conversion formula for the Unity depth export found. A
+  "raw millimeters" hypothesis is physically plausible (stomach endoscopy
+  working distances are typically single-digit to low-double-digit mm,
+  matching the observed 1-72 range almost exactly) and consistent with
+  `config.yaml`'s `fusion.depth_trunc: 0.15` (150mm), but this is an
+  inference, not a confirmed fact.
+- **This does not block Phase 3 training**, because the official repo's
+  own `EndoSfMLearner/eval_depth.py` applies **median-ratio scaling**
+  between predicted and GT depth (`ratio = median(gt)/median(pred)`)
+  before computing AbsRel/RMSE/delta1 — i.e. the reference methodology
+  itself treats predicted-vs-GT depth as scale-ambiguous rather than
+  assuming a known absolute unit. Phase 3 trains directly against the raw
+  pixel values (as float32) with a plain masked loss; true-metric
+  calibration, if ever needed, is a Phase 4 point-cloud-fusion concern,
+  not a Phase 3 training-time one.
+- **`has_depth` reconfirmed ~100%** for UnityCam: frame count (1548) ==
+  depth count (1548) exactly, matching the earlier dataset-loader
+  validation.
+- **Real bug found and fixed** (`src/data/endoslam_dataset.py`
+  `__getitem__`): `cv2.imread(path, IMREAD_UNCHANGED)` on a 4-channel PNG
+  returns `(H,W,4)`; `cv2.resize` preserves the channel count, so the
+  previous code silently produced `depths` of shape `(T,H,W,4)` instead
+  of the documented `(T,H,W)` — never caught because prior validation only
+  asserted pose tensor shapes, not depth shapes. Fixed by taking channel 0
+  (`d[..., 0]`) right after `imread`, before resize, since all four
+  channels are confirmed identical.
+
 ## Immediate next steps
 
 1. Phase 3: implement `_load_poses()` against the confirmed formats above
@@ -341,3 +386,17 @@ ritiksharma8/endoslam-phase3a-pose-explore`:
   blockers (pose parsing, split imbalance) are fully resolved and verified
   on the real dataset.** Mini-3D-Recon model design itself
   (backbone/pose-head/training loop) not started — next planning session.
+- 2026-08-13: Started Phase 3 model work. Planning decisions: train on
+  UnityCam only (matches README's literal wording, sidesteps the
+  unresolved real-cam/UnityCam pose coordinate-frame mismatch), pose head
+  predicts consecutive frame-to-frame relative pose (matches Phase 4's
+  "pose chaining" wording). Added `src/reconstruction/geometry.py`
+  (6D-rotation -> SE(3), relative-pose-from-absolute), validated locally.
+  Extracted `_select_device()`'s P100 workaround out of
+  `darkir_lite/train.py` into `src/common/device.py` for reuse. Ran the
+  `phase3b_depth_explore` kernel (v1, `COMPLETE`) to check UnityCam's
+  never-before-inspected depth format — see "Depth format — confirmed
+  facts" above; found and fixed a real shape bug in
+  `endoslam_dataset.py`'s depth loading (`(H,W,4)` instead of `(H,W)`)
+  along the way. Next: `src/reconstruction/model.py` (backbone + depth/pose
+  heads) and `loss.py`.
