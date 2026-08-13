@@ -108,26 +108,40 @@ documented Kaggle/PyTorch issue, not a bug in our code — see
 Tried `kaggle kernels push --accelerator nvidiaTeslaT4` to request a T4
 instead — Kaggle still assigned a P100 (the exact accelerator enum strings
 aren't documented, and/or T4 capacity wasn't available). Rather than keep
-guessing, `train.py::_select_device()` now does a real tiny op on `cuda`
-before trusting it and falls back to CPU on failure — this is what let the
-smoke test complete instead of crashing, but **CPU is only viable for a
-20-step smoke test, not the real 20-epoch run** (2162 steps/epoch — the
-smoke test's 20 steps + a 5-batch val check already took ~10 minutes on
-CPU). Options for the real run, not yet decided:
-1. Keep retrying pushes hoping for a T4 assignment (unreliable).
-2. Find the correct `--accelerator` string for T4 (current guess didn't work).
-3. Install a Pascal-compatible torch build on Kaggle (deviates from the
-   project's "never touch preinstalled torch" rule, but arguably justified
-   since the preinstalled build is incompatible with the hardware Kaggle
-   actually assigns here).
-4. Fall back to Google Colab for this phase (README already names it as
-   a fallback platform for exactly this kind of quota/compatibility issue).
+guessing, `train.py::_select_device()` does a real tiny op on `cuda` before
+trusting it and falls back to CPU on failure — this is what let the smoke
+test complete instead of crashing, but CPU was only viable for a 20-step
+smoke test, not the real run.
+
+**Fixed (2026-08-13, user has ~28h P100 quota and wants it used, not spent
+chasing T4).** PyTorch dropped Pascal (sm_60) support in 2.8; versions
+2.4-2.7 still ship sm_60 kernels; DarkIR's own repo pins exactly
+`torch==2.5.1`/`torchvision==0.20.1` — squarely in the compatible range.
+The training notebook now reinstalls that exact pin inside the Kaggle
+kernel (`notebooks/phase2_training`'s setup cell) — a deliberate, narrow
+exception to "never touch preinstalled torch," justified because the
+preinstalled build is already broken for the hardware Kaggle assigns here.
+First attempt used `--index-url` (wrong — replaces PyPI entirely, broke
+resolution of `nvidia-cudnn-cu12`, a PyPI-hosted transitive dep, so the
+reinstall silently failed and the original broken torch stayed active);
+fixed to `--extra-index-url`. **Confirmed working** on kernel
+`endoslam-phase2-darkir-training` v7: `torch: 2.5.1+cu121`, `device: cuda`,
+`GPU FIX CONFIRMED: real CUDA op succeeded`. 20 steps + partial val ran in
+~14.5s on GPU vs ~10 min on the CPU fallback (40x+ speedup).
+
+**Checkpoint persistence across sessions**: a full 20-epoch run (~2162
+steps/epoch, extrapolated ~20-25 min/epoch → ~7-8h total) likely won't fit
+one Kaggle session. The notebook checks for
+`checkpoints_resume/darkir_lite_latest.pt` after cloning and passes it to
+`train.py --resume` automatically if present — after any session that
+doesn't reach epoch 19, the latest `epoch_*.pt` gets downloaded and
+committed to that path, then the notebook re-pushed to continue.
 
 ## Immediate next steps
 
-1. Decide and implement a real GPU path (see options above), then run the
-   full 20-epoch fine-tune — `--max-steps` removed/raised, real training
-   time and final PSNR/SSIM to report.
+1. Full 20-epoch run in progress / to be resumed as needed — see the log
+   below for the latest epoch reached. Once epoch 19 completes, record
+   final train/val PSNR/SSIM here and mark Phase 2 fully done.
 2. Before Phase 3 (which needs real pose values): implement pose parsing
    for the `.xlsx` files — see TODOs below.
 
