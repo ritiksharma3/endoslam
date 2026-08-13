@@ -89,7 +89,13 @@ def run_condition(
 
         enhanced_images = None
         if condition == "darkir_lite_enhanced":
-            enhanced_images = darkir_model(dark_images.unsqueeze(0).to(device)).clamp(0.0, 1.0).squeeze(0).cpu()
+            # DarkIR is a per-frame model expecting (B,3,H,W) -- unlike
+            # MiniReconModel below, it has no notion of a temporal window, so
+            # the window's T frames go in as DarkIR's batch dimension
+            # directly (matches darkir_lite/train.py's own usage), not
+            # wrapped in an extra unsqueeze(0) (that produced a 5D tensor,
+            # which crashed DarkIR's `_, _, H, W = input.shape` unpack).
+            enhanced_images = darkir_model(dark_images.to(device)).clamp(0.0, 1.0).cpu()
             model_input = enhanced_images
         else:
             model_input = dark_images
