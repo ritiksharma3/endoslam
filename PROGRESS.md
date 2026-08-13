@@ -43,7 +43,7 @@ checklist, as work progresses.
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 8, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below); pose parsing and the split-imbalance fix (originally deferred) are now also implemented and validated — see Phase 3 prep notes below. `train_ds`/`val_ds`/`test_ds`: 16836/2032/2736 windows (post pose/split fix; was 17150/1885/2588 pre-fix). Dark-degradation visual check ran without error. |
 | 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Done.** Full 20-epoch fine-tune completed in a single Kaggle session on GPU (kernel `endoslam-phase2-darkir-training`, `COMPLETE`, 2026-08-13) — no resume cycle needed. Final checkpoint `epoch_19.pt`: `global_step=43240` (= 2162 steps/epoch x 20, exact), **val_psnr=32.40, val_ssim=0.9226** — up from the 20-step smoke test's 23.68/0.772. Checkpoint left in Kaggle kernel output only (not committed to the repo); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase2-darkir-training` when Phase 3/4 need the trained weights. |
-| 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | **Prep done, model not started.** Both blockers (pose parsing, UnityCam split imbalance) are resolved and validated on the real dataset — see "Pose format — confirmed facts" and the 2026-08-13 log entries below. The Mini-3D-Recon model itself (backbone/pose-head/training loop) is still unwritten. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
+| 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | **Done.** `MiniReconModel` (MobileNetV3-Small backbone + depth/pose heads, ~3M params) trained the full 40 epochs in one Kaggle session (kernel `endoslam-phase3-mini3drecon-training`, `COMPLETE`, 2026-08-13) — no resume needed. Final checkpoint `epoch_39.pt`: `global_step=12280` (= 307 steps/epoch x 40, exact), **val_depth_absrel=0.118, val_rot_err_deg=0.46°, val_trans_err=0.00357** (raw UnityCam world-units) — all improved sharply from the smoke test's 0.93/14.50°/0.031. Checkpoint left in Kaggle kernel output only (not committed); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase3-mini3drecon-training` when Phase 4 needs it. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
 
@@ -417,5 +417,16 @@ ritiksharma8/endoslam-phase3b-depth-explore`:
   `trans_loss`/`rot_loss` (0.058/0.326) — judged sufficient to not block
   the real run; `pose_rotation_weight: 10.0` left as-is). Checkpoint
   round-trip confirmed on real Kaggle infra. Flipped `MAX_STEPS` to `None`
-  and re-pushed for the real 40-epoch run — in progress, see next entry
-  for outcome once it lands.
+  and re-pushed for the real 40-epoch run.
+- 2026-08-13: Full 40-epoch Mini-3D-Recon run (kernel v2) completed in a
+  single Kaggle session — no resume cycle needed, mirroring Phase 2's
+  experience. Final checkpoint `epoch_39.pt`: `global_step=12280` (exactly
+  307 batches/epoch x 40), `val_depth_absrel=0.118` (down from 0.93 at the
+  20-step smoke test), `val_rot_err_deg=0.46°` (down from 14.50°),
+  `val_trans_err=0.00357` raw units (down from 0.031) — the model learned
+  both depth and relative pose well within this dataset's own scale.
+  **Phase 3 training is fully done.** `pose_rotation_weight: 10.0`'s guess
+  turned out fine in practice — rotation error converged to sub-degree
+  accuracy without needing adjustment. Not yet done: Phase 4 (pose
+  chaining + depth backprojection -> Open3D point cloud viewer) and Phase
+  5 (evaluation/report) — next planning session.
