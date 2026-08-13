@@ -1,0 +1,13 @@
+{
+  "id": "ritiksharma8/endoslam-phase3-mini3drecon-training",
+  "title": "endoslam-phase3-mini3drecon-training",
+  "code_file": "phase3_mini3drecon_training.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["mcocoz/endoslam"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
