@@ -222,6 +222,57 @@ ritiksharma8/endoslam-phase3b-depth-explore`:
   (`d[..., 0]`) right after `imread`, before resize, since all four
   channels are confirmed identical.
 
+## Phase 4 camera model — sourced but UNCONFIRMED (2026-08-13)
+
+Depth backprojection to a 3D point cloud needs camera intrinsics
+(focal length) and a way to convert UnityCam's raw depth-byte values into
+real scene-scale distance — neither has ever existed anywhere in this
+project, the EndoSLAM paper, or its repo (searched exhaustively; the
+paper's Table C.2 gives real intrinsics for HighCam/LowCam/MiroCam/PillCam
+via checkerboard calibration, but UnityCam is a synthetic Unity camera,
+never calibrated, and is absent from that table entirely).
+
+Found a real, sourced candidate by going one level further: the EndoSLAM
+README points to `github.com/CapsuleEndoscope/VirtualCapsuleEndoscopy` for
+"generation of synthetic data." Its
+`VR-Caps-Unity/Assets/Scenes/Record_scene.unity` (plain-text Unity scene
+YAML) contains a `Camera` GameObject (fileID 579270852) positioned near a
+physics-simulated `Capsule` GameObject (fileID 551316796, has a
+`Rigidbody` with `m_Mass: 0.01`), with:
+```
+m_FOVAxisMode: 0   # 0 = Vertical
+field of view: 91.320755
+near clip plane: 0.01
+far clip plane: 2
+```
+Two other cameras exist in the same scene — a "Main Camera" with untouched
+Unity defaults (FOV 67.38°, sensor 36x24mm — clearly not endoscope-
+specific) and a "MeshGenerationCam" (FOV 77°, used for the separate
+`3D_Scanners` mesh exports, not per-frame video) — the `Camera` object is
+the best candidate based on its close-range near/far clip (physically
+plausible for a capsule endoscope inside a stomach) and proximity to the
+physics-simulated capsule.
+
+**This is NOT 100% confirmed**: can't verify this exact scene generated
+the specific stomach dataset variant mirrored on Kaggle (`mcocoz/
+endoslam`), and the repo's other scene file (`Clinic Setup.unity`) wasn't
+checked. Also unconfirmed: the depth-byte-to-distance conversion
+(`near + byte/255*(far-near)`, the "Linear01Depth" convention — plausible
+since the project uses Unity's HDRP render pipeline, confirmed via an
+`HDRPDefaultResources` folder, whose depth AOV is conventionally output
+this way, but not verified for this specific export) and the
+backprojection axis convention (Unity is left-handed y-up; standard CV
+pinhole backprojection assumes a different convention — Phase 3's
+rotation-matrix loss never needed to care about this, so it's untested).
+
+**Both unconfirmed items get an empirical visual gate before being
+trusted**: `src/fusion/reconstruct.py::reconstruct_gt()` backprojects the
+dataset's own GT depth+pose (no model involved) — if it produces a
+coherent stomach-lumen tube shape rather than a scattered mess, that's
+real evidence the hypothesis holds; if not, revisit before trusting any
+model-based (`reconstruct_predicted()`) output. See the Log below for the
+outcome once run.
+
 ## Immediate next steps
 
 1. Phase 3: implement `_load_poses()` against the confirmed formats above
@@ -229,8 +280,9 @@ ritiksharma8/endoslam-phase3b-depth-explore`:
    column and the `frame_NNNNNN.jpg` filename), UnityCam loader truncates
    positionally to `min(frame_count, pose_row_count)` since there's no
    alignment key. **Done** — see the Log entry below.
-2. Write the Mini-3D-Recon model itself (backbone/pose-head/training loop)
-   — deliberately out of scope for the loader work above.
+2. Phase 4: run `phase4_reconstruction` on Kaggle, visually validate the
+   GT-mode reconstruction (resolves the camera-model hypothesis above),
+   then trust/inspect the predicted-mode output.
 
 ## Known open TODOs in code (not yet resolved)
 

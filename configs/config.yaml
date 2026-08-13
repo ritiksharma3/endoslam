@@ -50,8 +50,30 @@ reconstruction:
                                # was only caught by running the code, not reading the config.
 
 fusion:
-  voxel_downsample: 0.002  # meters, for Open3D point cloud downsampling
-  depth_trunc: 0.15        # meters, discard depth beyond this (endoscope-scale, not room-scale)
+  # Camera model is UNCONFIRMED for UnityCam -- no intrinsics exist anywhere
+  # in the EndoSLAM dataset/paper/repo. These are sourced from a Camera
+  # GameObject in github.com/CapsuleEndoscope/VirtualCapsuleEndoscopy's
+  # Record_scene.unity, positioned near a physics-simulated "Capsule"
+  # object -- plausible (close-range near/far clip matches a capsule
+  # endoscope), not 100% confirmed to be the exact camera that generated
+  # this dataset variant. See PROGRESS.md "Phase 4 camera model" and
+  # Step 4's GT-mode visual validation gate before trusting downstream use.
+  camera_fov_deg: 91.320755
+  near_clip: 0.01             # unity units
+  far_clip: 2.0                # unity units
+  depth_axis_y_down: true      # UNCONFIRMED -- backprojection axis convention (Unity is left-handed
+                                # y-up; standard CV pinhole assumes y-down). Resolve empirically by
+                                # sweeping true/false against the GT-mode reconstruction's visual shape.
+  voxel_downsample: 0.002  # unity units, for Open3D point cloud downsampling -- controls point
+                            # density, not signal discard, so low risk regardless of the unit hypothesis
+  depth_trunc: 0.65        # unity units, discard depth beyond this. CHANGED from an earlier 0.15
+                            # (meters) guess -- under the Linear01Depth hypothesis above, observed
+                            # depth bytes (1-72) map to ~0.02-0.565 unity units, so 0.15 would have
+                            # discarded most of the plausible signal.
+  anchor_predicted_to_gt_origin: true  # world-coordinate-frame origin choice only for predicted-mode
+                                        # pose chaining (no model-predicted equivalent exists for the
+                                        # chain's starting pose) -- not supervision leakage, everything
+                                        # inside the chain is still 100% model output.
 
 eval:
   pose_metrics: ["ATE", "RPE"]

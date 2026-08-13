@@ -256,6 +256,12 @@ class EndoSLAMStomachDataset(Dataset):
         return np.stack([_pose_matrix(t[i], q[i]) for i in range(len(df))]) if len(df) else np.empty((0, 4, 4), dtype=np.float32)
 
     def _apply_split(self, train_split: float, val_split: float, seed: int):
+        if self.split == "all":
+            # Phase 4 fusion wants the full contiguous sequence, unfiltered
+            # (train/val/test each only cover a positional slice of
+            # UnityCam's single sequence -- a qualitative reconstruction
+            # check needs the whole thing). Doesn't touch train/val/test.
+            return
         # UnityCam is the ONLY sequence with depth+pose GT (1 of 25 total
         # sequences) -- splitting it like a real-camera sequence (whole-unit,
         # shuffled) risks landing it 100% in one split, leaving val/test with

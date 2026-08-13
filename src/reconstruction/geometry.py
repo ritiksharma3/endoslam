@@ -28,3 +28,20 @@ def relative_pose_from_absolute(pose_t: torch.Tensor, pose_t1: torch.Tensor) -> 
     """(..., 4, 4), (..., 4, 4) absolute SE(3) poses -> (..., 4, 4) relative
     transform from t to t+1: inverse(pose_t) @ pose_t1."""
     return torch.linalg.inv(pose_t) @ pose_t1
+
+
+def absolute_poses_from_relative(pose0: torch.Tensor, rotations: torch.Tensor, translations: torch.Tensor) -> torch.Tensor:
+    """Inverse of relative_pose_from_absolute: pose_t1 = pose_t @ relative_t.
+
+    pose0: (4, 4) anchor absolute pose. rotations: (N, 3, 3), translations:
+    (N, 3) -- relative transforms t -> t+1. Returns (N+1, 4, 4): chain[0] =
+    pose0, chain[i+1] = chain[i] @ relative_i. A plain Python loop over N
+    matmuls -- N is small per call (one video sequence), not worth batching."""
+    relative = torch.eye(4, dtype=pose0.dtype, device=pose0.device).expand(rotations.shape[0], 4, 4).clone()
+    relative[:, :3, :3] = rotations
+    relative[:, :3, 3] = translations
+
+    chain = [pose0]
+    for i in range(rotations.shape[0]):
+        chain.append(chain[-1] @ relative[i])
+    return torch.stack(chain, dim=0)
