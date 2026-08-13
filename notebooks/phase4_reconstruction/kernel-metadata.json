@@ -1,0 +1,13 @@
+{
+  "id": "ritiksharma8/endoslam-phase4-reconstruction",
+  "title": "endoslam-phase4-reconstruction",
+  "code_file": "phase4_reconstruction.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["mcocoz/endoslam"],
+  "competition_sources": [],
+  "kernel_sources": ["ritiksharma8/endoslam-phase3-mini3drecon-training"]
+}
