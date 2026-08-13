@@ -41,6 +41,13 @@ reconstruction:
   lr: 2.0e-4  # same PyYAML bare-exponent gotcha as darkir_lite.lr above
   epochs: 40
   checkpoint_every_steps: 200
+  depth_loss_weight: 1.0
+  pose_loss_weight: 1.0
+  pose_rotation_weight: 10.0  # rotation term (radians-scale, 0..pi) vs translation L1 term
+                               # (raw UnityCam world-units, uncalibrated) -- a GUESS, check the
+                               # Kaggle smoke test's raw depth_loss/trans_loss/rot_loss printout
+                               # before trusting this default, same as darkir_lite.lr's string bug
+                               # was only caught by running the code, not reading the config.
 
 fusion:
   voxel_downsample: 0.002  # meters, for Open3D point cloud downsampling
