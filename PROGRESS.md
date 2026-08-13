@@ -398,5 +398,24 @@ ritiksharma8/endoslam-phase3b-depth-explore`:
   never-before-inspected depth format — see "Depth format — confirmed
   facts" above; found and fixed a real shape bug in
   `endoslam_dataset.py`'s depth loading (`(H,W,4)` instead of `(H,W)`)
-  along the way. Next: `src/reconstruction/model.py` (backbone + depth/pose
-  heads) and `loss.py`.
+  along the way. Implemented `src/reconstruction/model.py`
+  (`MiniReconModel`: MobileNetV3-Small backbone + `DepthHead` + `PoseHead`,
+  ~3M params), validated locally with real pretrained weights (correct
+  output shapes, orthonormal rotations, non-negative depth). Implemented
+  `loss.py` (masked depth L1, gradient-isolation checked; pose loss with a
+  trace-based rotation term) and `train.py` (mirrors `darkir_lite/train.py`
+  conventions exactly), validated locally against a fake in-memory dataset
+  (loss decreases over steps, checkpoint save/load round-trips with
+  bit-identical resumed output).
+- 2026-08-13: Pushed `phase3_training` to Kaggle. Smoke test (v1,
+  `--max-steps 20`, `COMPLETE`): `GPU FIX CONFIRMED` (Tesla P100, torch
+  2.5.1+cu121, same pin as Phase 2), `train batches: 307, val batches: 37`
+  (matches the confirmed 1227/147 UnityCam windows at `batch_size: 4`), no
+  NaN/crash, `rot_err_deg` dropped 37.58° → 14.50° within 20 steps (random
+  init typically starts ~90-120° for 3D rotations, so real learning is
+  happening despite `depth_loss` (10.57) dominating the raw loss sum over
+  `trans_loss`/`rot_loss` (0.058/0.326) — judged sufficient to not block
+  the real run; `pose_rotation_weight: 10.0` left as-is). Checkpoint
+  round-trip confirmed on real Kaggle infra. Flipped `MAX_STEPS` to `None`
+  and re-pushed for the real 40-epoch run — in progress, see next entry
+  for outcome once it lands.
