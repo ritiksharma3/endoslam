@@ -21,6 +21,15 @@ import argparse
 import os
 
 import cv2
+
+# OpenCV keeps its own internal thread pool, which is a known source of
+# deadlocks in PyTorch DataLoader worker processes after fork() -- the
+# worker inherits a broken thread-pool state. Disabling it here (before any
+# DataLoader with num_workers>0 is created) is the standard fix. This path
+# was never exercised in Phase 1 (no DataLoader workers there), so it's
+# untested outside this module.
+cv2.setNumThreads(0)
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +38,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
 from torch.utils.data import DataLoader, Dataset
 
+from src.common.device import select_device
 from src.data.dark_degradation import build_paired_dataset_entry
 from src.data.endoslam_dataset import EndoSLAMStomachDataset
 from src.darkir_lite.model import build_darkir_lite, freeze_encoder, unfreeze_all
@@ -119,28 +129,8 @@ def save_checkpoint(path, model, optimizer, epoch, global_step, val_psnr=None, v
     )
 
 
-def _select_device() -> str:
-    """torch.cuda.is_available() only checks that a CUDA driver is present,
-    not that this torch build actually ships kernels for the assigned GPU's
-    compute capability. Kaggle's API-pushed kernels default to a P100
-    (sm_60), and Kaggle's preinstalled torch build has been observed to
-    lack Pascal kernels entirely ("no kernel image is available for
-    execution on the device") -- confirmed on this project 2026-08-13.
-    Do a real op, not just a presence check, and fall back to CPU rather
-    than crash the whole run over an environment mismatch we don't
-    control (never pip-install/replace the preinstalled torch build)."""
-    if not torch.cuda.is_available():
-        return "cpu"
-    try:
-        torch.zeros(1, device="cuda") + torch.zeros(1, device="cuda")
-        return "cuda"
-    except RuntimeError as e:
-        print(f"CUDA reports available but a test op failed ({e}) -- falling back to CPU")
-        return "cpu"
-
-
 def train(config: dict, output_dir: str, resume_from: str | None = None, max_steps: int | None = None):
-    device = _select_device()
+    device = select_device()
     print(f"device: {device}")
 
     dcfg = config["darkir_lite"]
