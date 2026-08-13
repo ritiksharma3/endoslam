@@ -12,6 +12,10 @@ venv/
 *.ckpt
 *.pth
 checkpoints/
+# checkpoints_resume/darkir_lite_latest.pt is committed on purpose -- it's
+# the single resume checkpoint carrying Phase 2 training state across
+# separate Kaggle sessions (see PROGRESS.md). Not matched by "checkpoints/"
+# above (different directory name) or *.pth (it's .pt) -- keep it that way.
 
 # outputs
 outputs/
