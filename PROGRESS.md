@@ -41,9 +41,9 @@ checklist, as work progresses.
 | Phase | Days  | Deliverable | Status |
 |-------|-------|-------------|--------|
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
-| 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 7, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below). `train_ds`/`val_ds`/`test_ds` built successfully: 17150/1885/2588 windows. Dark-degradation visual check ran without error. Pose parsing intentionally deferred (see TODOs). |
+| 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 8, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below); pose parsing and the split-imbalance fix (originally deferred) are now also implemented and validated — see Phase 3 prep notes below. `train_ds`/`val_ds`/`test_ds`: 16836/2032/2736 windows (post pose/split fix; was 17150/1885/2588 pre-fix). Dark-degradation visual check ran without error. |
 | 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Done.** Full 20-epoch fine-tune completed in a single Kaggle session on GPU (kernel `endoslam-phase2-darkir-training`, `COMPLETE`, 2026-08-13) — no resume cycle needed. Final checkpoint `epoch_19.pt`: `global_step=43240` (= 2162 steps/epoch x 20, exact), **val_psnr=32.40, val_ssim=0.9226** — up from the 20-step smoke test's 23.68/0.772. Checkpoint left in Kaggle kernel output only (not committed to the repo); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase2-darkir-training` when Phase 3/4 need the trained weights. |
-| 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | Not started. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
+| 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | **Prep done, model not started.** Both blockers (pose parsing, UnityCam split imbalance) are resolved and validated on the real dataset — see "Pose format — confirmed facts" and the 2026-08-13 log entries below. The Mini-3D-Recon model itself (backbone/pose-head/training loop) is still unwritten. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
 
@@ -325,5 +325,19 @@ ritiksharma8/endoslam-phase3a-pose-explore`:
   Phase 3 is resolved.** Kaggle-only validation (real 25-sequence dataset,
   full `_index_real_camera()`/`_index_unitycam()` run, `__getitem__`
   end-to-end) still pending — next step per the plan is extending
-  `phase1_data_validation.ipynb` with pose/split assertion cells. Mini-3D-
-  Recon model design itself (backbone/pose-head/training loop) not started.
+  `phase1_data_validation.ipynb` with pose/split assertion cells.
+- 2026-08-13: Extended `phase1_data_validation.ipynb` with pose/split
+  assertion cells and re-ran it on Kaggle (kernel
+  `endoslam-phase1-validation` v8, `COMPLETE`) against the real 25-sequence
+  dataset — confirms everything above at full scale, not just the 3 sampled
+  trajectories/synthetic fixtures: all 24 real-camera trajectories parsed
+  with pose rows (no crashes), UnityCam consistently drops 1/1544 NaN row
+  and truncates to 1543 (matches the local finding exactly), and the split
+  fix gives every split non-zero UnityCam windows for the first time
+  (train=1227, val=147, test=148, out of 16836/2032/2736 total windows —
+  window counts differ from the pre-fix run's 17150/1885/2588 as expected,
+  since UnityCam's split behavior changed). Pose tensors are `(T,4,4)`, no
+  NaNs, valid SE(3) bottom row, checked on all three splits. **Both Phase 3
+  blockers (pose parsing, split imbalance) are fully resolved and verified
+  on the real dataset.** Mini-3D-Recon model design itself
+  (backbone/pose-head/training loop) not started — next planning session.
