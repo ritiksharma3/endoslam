@@ -42,7 +42,7 @@ checklist, as work progresses.
 |-------|-------|-------------|--------|
 | 0 | 1 | Repo, env, Kaggle/Colab pipeline, dataset confirmed accessible | Done. Dataset access confirmed via the Kaggle API — `mcocoz/endoslam` (~10.4GB) is real and mounts correctly once the nested path is resolved (see "Where code runs"). |
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 7, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below). `train_ds`/`val_ds`/`test_ds` built successfully: 17150/1885/2588 windows. Dark-degradation visual check ran without error. Pose parsing intentionally deferred (see TODOs). |
-| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Pipeline implemented and smoke-tested on Kaggle.** `src/darkir_lite/model.py` + `train.py` written against facts confirmed in exploration kernel v3, validated locally (real DarkIR repo + real checkpoint + synthetic frames), then smoke-tested for real: kernel `endoslam-phase2-darkir-training` v5 `COMPLETE` 2026-08-13, `--max-steps 20` — **train_loss=0.0007, val_psnr=23.68, val_ssim=0.772**, checkpoint saved and reloadable. Ran on CPU (see "GPU compatibility issue" below) — **full 20-epoch run needs a working GPU path first, that's the next action, not yet done.** |
+| 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Done.** Full 20-epoch fine-tune completed in a single Kaggle session on GPU (kernel `endoslam-phase2-darkir-training`, `COMPLETE`, 2026-08-13) — no resume cycle needed. Final checkpoint `epoch_19.pt`: `global_step=43240` (= 2162 steps/epoch x 20, exact), **val_psnr=32.40, val_ssim=0.9226** — up from the 20-step smoke test's 23.68/0.772. Checkpoint left in Kaggle kernel output only (not committed to the repo); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase2-darkir-training` when Phase 3/4 need the trained weights. |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | Not started. Highest-risk phase per README — cut context window/backbone/epochs first if time runs short, not eval/report. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
@@ -139,11 +139,8 @@ committed to that path, then the notebook re-pushed to continue.
 
 ## Immediate next steps
 
-1. Full 20-epoch run in progress / to be resumed as needed — see the log
-   below for the latest epoch reached. Once epoch 19 completes, record
-   final train/val PSNR/SSIM here and mark Phase 2 fully done.
-2. Before Phase 3 (which needs real pose values): implement pose parsing
-   for the `.xlsx` files — see TODOs below.
+1. Phase 3: implement pose parsing for the `.xlsx` files (real-camera and
+   UnityCam formats) — see TODOs below. This is the current blocker.
 
 ## Known open TODOs in code (not yet resolved)
 
@@ -234,3 +231,15 @@ committed to that path, then the notebook re-pushed to continue.
   on CPU — train_loss=0.0007, val_psnr=23.68, val_ssim=0.772, checkpoint
   saved and reloadable. **Pipeline is smoke-tested end-to-end.** Full
   20-epoch run still needs a real GPU path (CPU is far too slow for it).
+- 2026-08-13: Checked on the full 20-epoch run kicked off after the GPU fix
+  (v7). `kaggle kernels status` returned `COMPLETE`; downloaded kernel
+  output and found `epoch_19.pt` already present, meaning the run finished
+  in a single Kaggle session — no resume cycle was needed after all.
+  Loaded the checkpoint locally (`torch.load`, CPU) to confirm: `epoch=19`,
+  `global_step=43240` (exactly 2162 steps/epoch x 20), `val_psnr=32.40`,
+  `val_ssim=0.9226`, a clean improvement over the smoke test. Stopped the
+  in-progress download of ~236 intermediate step checkpoints (~9GB, not
+  needed) once the final metrics were confirmed from `epoch_19.pt` itself.
+  Decided not to commit the final checkpoint into the repo — it'll be
+  re-fetched from Kaggle kernel output whenever Phase 3/4 need it.
+  **Phase 2 is fully done.** Next: pose parsing for Phase 3.

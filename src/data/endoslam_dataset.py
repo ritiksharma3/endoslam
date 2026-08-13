@@ -68,6 +68,7 @@ class EndoSLAMStomachDataset(Dataset):
         self.context_window = context_window
         self.cameras = cameras
         self.split = split
+        self.synthetic_cam = config["data"]["synthetic_cam"]
 
         self.sequences = self._index_sequences()
         self._apply_split(config["data"]["train_split"], config["data"]["val_split"], config["data"]["seed"])
@@ -140,19 +141,44 @@ class EndoSLAMStomachDataset(Dataset):
         raise NotImplementedError("pose parsing not yet implemented -- see module docstring")
 
     def _apply_split(self, train_split: float, val_split: float, seed: int):
-        seq_ids = sorted(self.sequences.keys())
+        # UnityCam is the ONLY sequence with depth+pose GT (1 of 25 total
+        # sequences) -- splitting it like a real-camera sequence (whole-unit,
+        # shuffled) risks landing it 100% in one split, leaving val/test with
+        # zero quantitative-eval samples. Real-camera sequences keep the
+        # original whole-sequence shuffle+slice; UnityCam instead gets sliced
+        # positionally by the same fractions *within* its own frame range, so
+        # every split gets a share of it. Side effect: up to
+        # context_window - 1 frames are lost at each UnityCam split boundary
+        # (no window can cross it) -- correct, since it prevents temporal
+        # leakage across train/val/test.
+        real_keys = [k for k, v in self.sequences.items() if v[0].camera != self.synthetic_cam]
+        unity_keys = [k for k, v in self.sequences.items() if v[0].camera == self.synthetic_cam]
+
         rng = random.Random(seed)
-        rng.shuffle(seq_ids)
-        n = len(seq_ids)
+        rng.shuffle(real_keys)
+        n = len(real_keys)
         n_train = int(n * train_split)
         n_val = int(n * val_split)
         if self.split == "train":
-            keep = seq_ids[:n_train]
+            keep_real = real_keys[:n_train]
         elif self.split == "val":
-            keep = seq_ids[n_train:n_train + n_val]
+            keep_real = real_keys[n_train:n_train + n_val]
         else:
-            keep = seq_ids[n_train + n_val:]
-        self.sequences = {k: v for k, v in self.sequences.items() if k in keep}
+            keep_real = real_keys[n_train + n_val:]
+
+        kept = {k: self.sequences[k] for k in keep_real}
+        for k in unity_keys:
+            samples = self.sequences[k]
+            m = len(samples)
+            m_train = int(m * train_split)
+            m_val = int(m * val_split)
+            if self.split == "train":
+                kept[k] = samples[:m_train]
+            elif self.split == "val":
+                kept[k] = samples[m_train:m_train + m_val]
+            else:
+                kept[k] = samples[m_train + m_val:]
+        self.sequences = kept
 
     def _build_windows(self) -> list[list[FrameSample]]:
         windows = []

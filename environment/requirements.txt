@@ -10,3 +10,6 @@ matplotlib
 tensorboard
 ptflops  # required to import anything from DarkIR's archs/ package (archs/__init__.py
          # imports it at module level) -- confirmed missing on Kaggle's base image
+pandas   # reading pose .xlsx files (Phase 3)
+openpyxl # pandas' .xlsx engine -- pandas doesn't bundle it
+scipy    # scipy.spatial.transform.Rotation, for quaternion/Euler -> SE(3) matrix conversion
