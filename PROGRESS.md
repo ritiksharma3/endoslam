@@ -44,7 +44,7 @@ checklist, as work progresses.
 | 1 | 2-5 | Dataset loader working, synthetic dark-degradation validated | **Done and validated on Kaggle** (kernel `endoslam-phase1-validation`, version 8, `COMPLETE`, 2026-08-13). `_index_sequences()` rewritten to match the real layout (see below); pose parsing and the split-imbalance fix (originally deferred) are now also implemented and validated — see Phase 3 prep notes below. `train_ds`/`val_ds`/`test_ds`: 16836/2032/2736 windows (post pose/split fix; was 17150/1885/2588 pre-fix). Dark-degradation visual check ran without error. |
 | 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Done.** Full 20-epoch fine-tune completed in a single Kaggle session on GPU (kernel `endoslam-phase2-darkir-training`, `COMPLETE`, 2026-08-13) — no resume cycle needed. Final checkpoint `epoch_19.pt`: `global_step=43240` (= 2162 steps/epoch x 20, exact), **val_psnr=32.40, val_ssim=0.9226** — up from the 20-step smoke test's 23.68/0.772. Checkpoint left in Kaggle kernel output only (not committed to the repo); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase2-darkir-training` when Phase 3/4 need the trained weights. |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | **Done.** `MiniReconModel` (MobileNetV3-Small backbone + depth/pose heads, ~3M params) trained the full 40 epochs in one Kaggle session (kernel `endoslam-phase3-mini3drecon-training`, `COMPLETE`, 2026-08-13) — no resume needed. Final checkpoint `epoch_39.pt`: `global_step=12280` (= 307 steps/epoch x 40, exact), **val_depth_absrel=0.118, val_rot_err_deg=0.46°, val_trans_err=0.00357** (raw UnityCam world-units) — all improved sharply from the smoke test's 0.93/14.50°/0.031. Checkpoint left in Kaggle kernel output only (not committed); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase3-mini3drecon-training` when Phase 4 needs it. |
-| 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | Not started. |
+| 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | **Done.** Kernel `endoslam-phase4-reconstruction`, `COMPLETE` — GT-mode reconstruction produced a coherent stomach-lumen tube shape (not scattered), passing the empirical gate for the sourced-but-unconfirmed camera model. See "Phase 4 reconstruction run" below. |
 | 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
 
 ## Real EndoSLAM layout (confirmed, replaces all earlier guesses)
@@ -282,7 +282,46 @@ outcome once run.
    alignment key. **Done** — see the Log entry below.
 2. Phase 4: run `phase4_reconstruction` on Kaggle, visually validate the
    GT-mode reconstruction (resolves the camera-model hypothesis above),
-   then trust/inspect the predicted-mode output.
+   then trust/inspect the predicted-mode output. **Done** — see "Phase 4
+   reconstruction run" below.
+3. Phase 5: implement `src/eval/metrics.py` (depth AbsRel/RMSE/delta1 with
+   median-ratio scaling, ATE/RPE via Umeyama-aligned trajectories) and
+   `src/eval/run_comparison.py` (raw-dark vs DarkIR-enhanced input through
+   the trained Mini-3D-Recon model on the UnityCam test split, fixed-seed
+   degradation so both conditions see identical dark input), run on Kaggle,
+   then write the final `REPORT.md`.
+
+## Phase 4 reconstruction run (2026-08-13, `endoslam-phase4-reconstruction` kernel)
+
+Ran `phase4_reconstruction.ipynb` on Kaggle (GPU off, inference-only —
+~3M-param model, ~1541 forward passes, CPU-tractable): `COMPLETE`. Output
+downloaded (`kaggle kernels output`): `pointclouds/{gt_ydown_True,
+gt_ydown_False,predicted}.ply` + matching `previews/*.png` (matplotlib
+scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
+
+- **GT-mode sweep (`y_down` True vs False)**: both produced a coherent,
+  continuous, branching stomach-lumen tube shape — neither was a scattered
+  mess. This passes the empirical gate `reconstruct_gt()`'s docstring and
+  the notebook's own "Done" cell describe: the sourced-but-unconfirmed
+  camera model (FOV 91.32°, near/far clip 0.01/2.0, Linear01Depth
+  byte→distance conversion — see "Phase 4 camera model" above) is now
+  **empirically supported**, not just sourced.
+- **`y_down` decision**: the sweep wasn't a stark differentiator (both
+  looked like plausible tubes), so kept the existing `configs/config.yaml`
+  default (`depth_axis_y_down: true`) rather than flipping it on weak
+  evidence — this is also the setting `predicted.png` was generated under.
+- **Predicted-mode**: run under `y_down=true`, anchored at GT frame 0's
+  absolute pose (`anchor_predicted_to_gt_origin` — world-frame origin
+  choice only, not supervision leakage). Its point cloud is structurally
+  consistent with the GT-mode tube shape (similar extent/envelope, same
+  branching character) — a real signal that Phase 3's model produces
+  geometrically sound depth+pose, not just low loss numbers.
+- **"Point cloud viewer" deliverable**: satisfied by the `.ply` files
+  (openable in any Open3D-based tool locally) + the preview PNGs — no
+  interactive viewer script written, since Kaggle is headless (no
+  OpenGL/display) and an interactive session only makes sense locally.
+  `.ply` files were not committed to the repo (same "re-fetch from Kaggle
+  kernel output when needed" pattern as the Phase 2/3 checkpoints).
 
 ## Known open TODOs in code (not yet resolved)
 
@@ -482,3 +521,13 @@ outcome once run.
   accuracy without needing adjustment. Not yet done: Phase 4 (pose
   chaining + depth backprojection -> Open3D point cloud viewer) and Phase
   5 (evaluation/report) — next planning session.
+- 2026-08-13: Ran `phase4_reconstruction` on Kaggle (kernel
+  `endoslam-phase4-reconstruction`, `COMPLETE`, GPU off). See "Phase 4
+  reconstruction run" above for full detail — summary: both `y_down`
+  sweep variants produced coherent GT-mode tube shapes, empirically
+  confirming the sourced camera-model hypothesis; kept the existing
+  `depth_axis_y_down: true` default; predicted-mode output (same setting)
+  matched the GT tube's shape, a real Phase 3 quality signal. `.ply` +
+  preview PNGs satisfy the "point cloud viewer" deliverable given headless
+  Kaggle. **Phase 4 is done.** Next: Phase 5 (with/without-DarkIR
+  comparison, ATE/RPE + AbsRel/RMSE/delta1, report).

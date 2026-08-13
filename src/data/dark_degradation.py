@@ -24,10 +24,11 @@ import numpy as np
 import cv2
 
 
-def random_motion_blur_kernel(size: int) -> np.ndarray:
+def random_motion_blur_kernel(size: int, rng: np.random.Generator | None = None) -> np.ndarray:
     """Simple linear motion blur kernel at a random angle."""
+    rng = rng or np.random.default_rng()
     kernel = np.zeros((size, size), dtype=np.float32)
-    angle = np.random.uniform(0, 180)
+    angle = rng.uniform(0, 180)
     kernel[size // 2, :] = 1.0
     center = (size / 2 - 0.5, size / 2 - 0.5)
     rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -49,7 +50,7 @@ def degrade_frame(
     k_size = int(rng.integers(blur_kernel_range[0] // 2, blur_kernel_range[1] // 2 + 1)) * 2 + 1
     noise_std = rng.uniform(*noise_std_range)
 
-    kernel = random_motion_blur_kernel(k_size)
+    kernel = random_motion_blur_kernel(k_size, rng=rng)
     blurred = cv2.filter2D(clean_rgb, -1, kernel)
 
     darkened = gamma * blurred
