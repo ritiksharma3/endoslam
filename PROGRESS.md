@@ -431,6 +431,58 @@ surface patch — a real, clear improvement over the full-video blob.**
 Trade-off is expected and inherent: one partial view instead of a fused
 multi-frame reconstruction.
 
+**ICP pose refinement added to full-video mode (2026-08-14).** User ran
+`--best-frame` on their own real ~2-minute video (see below) and it worked,
+but they actually wanted the *full-video* reconstruction fixed instead —
+specifically called out that the endoscope moves back and forth, revisiting
+the same tissue, and asked for something that references recent frames to
+reduce the resulting overlap. Root cause confirmed: `reconstruct_video()`
+was blindly trusting Mini-3D-Recon's raw predicted relative pose every step
+and chaining them with zero correction — drift compounds, and there's no
+mechanism to recognize a revisit, so the same tissue gets placed twice
+instead of merged. User explicitly chose the scoped fix (geometric
+self-consistency now, not fine-tuning on real data or full loop-closure
+SLAM — both flagged as much bigger undertakings and declined this round).
+
+Restructured `reconstruct_video()`'s fusion stage in
+`src/inference/reconstruct_video.py` from "collect the whole video's
+depths/poses, batch-chain them, then backproject" into an incremental
+per-frame loop (window-iteration/model-inference side unchanged):
+- `refine_pose_icp()` — point-to-plane ICP (Open3D-native) between a new
+  frame's points (already placed by the network's raw predicted-pose
+  chain) and a reference cloud built from the last `--icp-window` (default
+  15) already-fused frames. Both sides voxel-downsampled first (coarser
+  than the final fusion voxel size — ICP is expensive). Returns a
+  correction transform + fitness; the caller only trusts it above
+  `--icp-fitness-threshold` (default 0.3), falling back to the
+  uncorrected network pose otherwise (e.g. genuinely new, non-overlapping
+  territory — a bad forced alignment there would be worse than none).
+- `frame_quality_score()` generalized to also accept the float32 RGB
+  arrays this module already works in (was BGR-uint8-only, written for
+  `select_best_frame()`) — now also gates *fusion* in full-video mode:
+  a frame that fails it (blurry/near-black/blown-out, scored on the raw
+  pre-DarkIR frame) still advances the pose chain but doesn't contribute
+  points to the cloud or the ICP reference window, so transient
+  motion-blurred frames during fast back-and-forth movement don't inject
+  garbage geometry.
+- Three new CLI flags: `--icp-window`, `--icp-max-corr-dist` (defaults to
+  10x `fusion.voxel_downsample`), `--icp-fitness-threshold`.
+
+**Real limit, stated for the record**: this is geometric
+self-consistency, not accuracy — the depth network is still monocular and
+still has the documented domain gap. Sliding-window ICP only catches
+*local* revisits (within the window); a revisit from far earlier in the
+video needs full loop-closure/pose-graph SLAM, out of scope per the user's
+own choice this session.
+
+Validated: unit test recovers a known synthetic SE(3) perturbation via
+`refine_pose_icp` on a bumpy synthetic surface (0.00° rotation error,
+~0 translation error, fitness 1.0), confirms near-zero fitness on two
+genuinely non-overlapping point sets (the fallback trigger), and confirms
+the empty-input edge case returns identity/0.0 rather than crashing. Real
+end-to-end smoke test with the trained checkpoints against 20 synthetic
+frames: 20/20 fused, 19 ICP-corrected, no crash, non-empty point cloud.
+
 ## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
 
 Ran `phase5_evaluation.ipynb` on Kaggle (GPU off, inference-only, UnityCam
@@ -805,3 +857,17 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   vignette/HUD region before feeding frames to either model, if
   reconstructing HUD-overlaid clinical recordings becomes a real use case
   rather than a one-off test.
+- 2026-08-14: User clarified they actually want the *full-video*
+  reconstruction improved, not just `--best-frame` — called out the
+  endoscope's back-and-forth motion causing overlapping/messy geometry,
+  asked for correction referencing recent frames. Confirmed scope with the
+  user first (ICP-based geometric self-consistency now vs. real-data
+  fine-tuning or full SLAM later — user chose the former). Restructured
+  `reconstruct_video()`'s fusion stage to incrementally ICP-correct each
+  frame's pose against a sliding window of recently-fused frames instead
+  of blindly chaining raw predicted poses; also gates fusion (not model
+  inference) on frame_quality_score so blurry/degenerate frames don't
+  contribute geometry. See "ICP pose refinement added to full-video mode"
+  above for full detail. Unit tests + a real-checkpoint smoke test both
+  pass. Next: re-run full-video mode against the user's `Video1.avi` and
+  compare against the earlier blob result.

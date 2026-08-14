@@ -54,6 +54,7 @@ real multi-minute video.
 
 import argparse
 import os
+from collections import deque
 
 import cv2
 import matplotlib.pyplot as plt
@@ -67,7 +68,6 @@ from src.darkir_lite.model import build_darkir_lite
 from src.fusion.backproject import backproject_depth, transform_points_to_world
 from src.fusion.intrinsics import depth_byte_to_unity_units, fov_to_intrinsics
 from src.fusion.pointcloud import accumulate_point_cloud, apply_depth_trunc_mask
-from src.reconstruction.geometry import absolute_poses_from_relative
 from src.reconstruction.model import MiniReconModel
 
 
@@ -119,9 +119,12 @@ def build_windows(frames: torch.Tensor, context_window: int) -> list[torch.Tenso
     return [frames[start:start + context_window] for start in range(0, max(1, n - context_window + 1))]
 
 
-def frame_quality_score(frame_bgr: np.ndarray, dark_min: float = 0.02, bright_max: float = 0.95) -> tuple[float, bool]:
-    """frame_bgr: (H,W,3) uint8 BGR, straight from cv2.VideoCapture.read()
-    (before any resize/color conversion). Returns (sharpness, is_valid).
+def frame_quality_score(frame: np.ndarray, dark_min: float = 0.02, bright_max: float = 0.95) -> tuple[float, bool]:
+    """frame: (H,W,3) uint8 BGR straight from cv2.VideoCapture.read() (used
+    by select_best_frame()), OR (H,W,3) float32 [0,1] RGB (the format
+    reconstruct_video() already works in, used to gate fusion there) --
+    accepts either so both call sites share one implementation instead of
+    duplicating the heuristic. Returns (sharpness, is_valid).
 
     sharpness = variance of the Laplacian on grayscale -- standard,
     cheap blur-detection heuristic (higher = sharper). is_valid = mean
@@ -131,7 +134,11 @@ def frame_quality_score(frame_bgr: np.ndarray, dark_min: float = 0.02, bright_ma
     darkness within that range -- brightening a dark-but-sharp frame is
     exactly DarkIR-lite's job; biasing selection toward "already bright"
     frames would undercut the whole point of this project."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if frame.dtype == np.uint8:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        frame_uint8 = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+        gray = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2GRAY)
     sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
     brightness = gray.mean() / 255.0
     is_valid = dark_min < brightness < bright_max
@@ -247,6 +254,43 @@ def save_preview(pcd: o3d.geometry.PointCloud, path: str, max_points: int = 3000
     plt.close(fig)
 
 
+def refine_pose_icp(
+    points_world_guess: np.ndarray,
+    reference_points: np.ndarray,
+    max_correspondence_distance: float,
+    icp_voxel_size: float,
+) -> tuple[np.ndarray, float]:
+    """Aligns points_world_guess (a new frame's backprojected points,
+    already transformed by the network's predicted initial pose) against
+    reference_points (a sliding window of the last N already-placed
+    frames' points -- see reconstruct_video()) via point-to-plane ICP.
+    Both point sets are voxel-downsampled first, coarser than the final
+    fusion voxel size -- ICP is expensive, this keeps per-frame cost
+    tractable over a multi-thousand-frame video. Returns (correction
+    (4,4) SE(3) to left-multiply onto the initial pose guess, fitness in
+    [0,1] -- fraction of source points with a good correspondence, the
+    caller's signal for whether to trust this correction or fall back to
+    the uncorrected guess when there's genuinely no geometric overlap)."""
+    source = o3d.geometry.PointCloud()
+    source.points = o3d.utility.Vector3dVector(points_world_guess)
+    source = source.voxel_down_sample(icp_voxel_size)
+
+    reference = o3d.geometry.PointCloud()
+    reference.points = o3d.utility.Vector3dVector(reference_points)
+    reference = reference.voxel_down_sample(icp_voxel_size)
+
+    if len(source.points) == 0 or len(reference.points) == 0:
+        return np.eye(4), 0.0
+
+    reference.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_voxel_size * 2, max_nn=30))
+
+    result = o3d.pipelines.registration.registration_icp(
+        source, reference, max_correspondence_distance, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+    )
+    return result.transformation, result.fitness
+
+
 @torch.no_grad()
 def reconstruct_video(
     frames: torch.Tensor,
@@ -254,18 +298,40 @@ def reconstruct_video(
     mini_recon_model: torch.nn.Module,
     config: dict,
     device: str,
+    icp_window: int = 15,
+    icp_max_corr_dist: float | None = None,
+    icp_fitness_threshold: float = 0.3,
 ) -> o3d.geometry.PointCloud:
     """frames: (N,3,H,W) clean-or-dark [0,1] RGB (see load_video_frames).
-    Runs DarkIR-lite -> Mini-3D-Recon per window, chains predicted relative
-    poses from an identity anchor (no GT exists for an arbitrary video),
-    backprojects, and fuses into one point cloud. Structurally mirrors
-    src/fusion/reconstruct.py's reconstruct_predicted() -- see this module's
-    docstring for the two real differences (DarkIR-in-the-loop, identity
-    anchor)."""
+    Runs DarkIR-lite -> Mini-3D-Recon per window (unchanged from before),
+    then fuses **incrementally**: each frame's pose starts as a guess
+    chained from the *previous refined* pose (not a one-shot batch chain
+    computed up front), then gets corrected by ICP against a sliding
+    window of the last `icp_window` already-placed frames' points
+    (refine_pose_icp()) before being added to the point cloud. This
+    targets two real problems a naive uncorrected chain has on real
+    footage: drift compounding every step with nothing to correct it, and
+    no mechanism to recognize when the camera revisits the same tissue
+    (e.g. back-and-forth motion) -- a naive chain just places the revisit
+    wherever the already-drifted trajectory says to, producing duplicate/
+    offset surfaces. ICP against recent frames pulls a genuine revisit
+    back into alignment instead. This is geometric self-consistency, not
+    ground-truth accuracy -- see this module's docstring for the real
+    limits (still monocular depth, still the documented domain gap, and
+    sliding-window ICP only catches *local* revisits, not a revisit from
+    far earlier in the video -- that needs full loop-closure SLAM).
+
+    Frames that fail frame_quality_score() (blurry/near-black/blown-out --
+    scored on the *raw* pre-DarkIR frame, since enhancement can make a
+    genuinely-degenerate frame look artificially sharp) still advance the
+    pose chain, so the next frame's initial guess stays sane, but don't
+    contribute points to the fused cloud or the ICP reference window."""
     fcfg = config["fusion"]
     H, W = tuple(config["data"]["image_size"])
     fx, fy, cx, cy = fov_to_intrinsics(fcfg["camera_fov_deg"], (H, W))
     context_window = config["reconstruction"]["context_window"]
+    icp_max_corr_dist = icp_max_corr_dist or fcfg["voxel_downsample"] * 10
+    icp_voxel_size = fcfg["voxel_downsample"] * 4  # coarser than the final fusion voxel size -- ICP is expensive
 
     windows = build_windows(frames, context_window)
     n = len(windows)
@@ -275,6 +341,7 @@ def reconstruct_video(
 
     all_depths: list[np.ndarray] = []
     all_colors: list[np.ndarray] = []
+    all_valid: list[bool] = []
     all_rotations: list[torch.Tensor] = []
     all_translations: list[torch.Tensor] = []
 
@@ -296,29 +363,56 @@ def reconstruct_video(
         if i < n - 1:
             all_depths.append(depth[0].cpu().numpy())
             all_colors.append(enhanced_cpu[0].permute(1, 2, 0).numpy())
+            all_valid.append(frame_quality_score(window[0].permute(1, 2, 0).numpy())[1])
             all_rotations.append(rotation[0].cpu())
             all_translations.append(translation[0].cpu())
         else:
             for t in range(depth.shape[0]):
                 all_depths.append(depth[t].cpu().numpy())
                 all_colors.append(enhanced_cpu[t].permute(1, 2, 0).numpy())
+                all_valid.append(frame_quality_score(window[t].permute(1, 2, 0).numpy())[1])
             for t in range(rotation.shape[0]):
                 all_rotations.append(rotation[t].cpu())
                 all_translations.append(translation[t].cpu())
 
-    rotations = torch.stack(all_rotations)
-    translations = torch.stack(all_translations)
-    pose0 = torch.eye(4)  # no GT for an arbitrary video -- world origin = frame 0's camera pose
-    absolute_poses = absolute_poses_from_relative(pose0, rotations, translations).numpy()
-
     def frame_iter():
+        absolute_pose = np.eye(4)
+        reference_window: deque = deque(maxlen=icp_window)
+        n_fused, n_corrected = 0, 0
+
         for i, depth_byte in enumerate(all_depths):
+            if i > 0:
+                relative = np.eye(4)
+                relative[:3, :3] = all_rotations[i - 1].numpy()
+                relative[:3, 3] = all_translations[i - 1].numpy()
+                absolute_pose = absolute_pose @ relative
+
             depth_units = depth_byte_to_unity_units(depth_byte, fcfg["near_clip"], fcfg["far_clip"])
             mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
             points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
-            points_world = transform_points_to_world(points_cam[mask], absolute_poses[i])
+            points_cam_masked = points_cam[mask]
             colors = all_colors[i][mask]
-            yield points_world, colors
+
+            points_world = transform_points_to_world(points_cam_masked, absolute_pose)
+
+            if len(reference_window) > 0 and len(points_world) > 0:
+                reference_points = np.concatenate(list(reference_window), axis=0)
+                correction, fitness = refine_pose_icp(
+                    points_world, reference_points, icp_max_corr_dist, icp_voxel_size
+                )
+                if fitness >= icp_fitness_threshold:
+                    absolute_pose = correction @ absolute_pose
+                    points_world = transform_points_to_world(points_cam_masked, absolute_pose)
+                    n_corrected += 1
+
+            if all_valid[i]:
+                reference_window.append(points_world)
+                n_fused += 1
+                yield points_world, colors
+
+        print(f"reconstruct_video: fused {n_fused}/{len(all_depths)} frames "
+              f"({n_corrected} ICP-corrected, icp_window={icp_window}, "
+              f"icp_fitness_threshold={icp_fitness_threshold})")
 
     return accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
 
@@ -335,6 +429,15 @@ def main():
     parser.add_argument("--best-frame", action="store_true",
                          help="reconstruct only the single sharpest/best-lit frame (no pose chaining, "
                               "avoids multi-frame drift on out-of-domain footage) instead of the whole video")
+    parser.add_argument("--icp-window", type=int, default=15,
+                         help="full-video mode only: number of recent already-placed frames used as the ICP "
+                              "reference when correcting each new frame's pose")
+    parser.add_argument("--icp-max-corr-dist", type=float, default=None,
+                         help="full-video mode only: ICP max correspondence distance, in config.yaml's fusion "
+                              "scene units; defaults to 10x fusion.voxel_downsample")
+    parser.add_argument("--icp-fitness-threshold", type=float, default=0.3,
+                         help="full-video mode only: minimum ICP fitness to trust a pose correction; below this, "
+                              "fall back to the network's raw predicted pose")
     parser.add_argument("--no-view", action="store_true", help="skip popping the interactive Open3D window")
     args = parser.parse_args()
 
@@ -362,7 +465,12 @@ def main():
     else:
         frames = load_video_frames(args.video, image_size, frame_stride=args.frame_stride, max_frames=args.max_frames)
         print(f"loaded {frames.shape[0]} frames from {args.video}")
-        pcd = reconstruct_video(frames, darkir_model, mini_recon_model, config, device)
+        pcd = reconstruct_video(
+            frames, darkir_model, mini_recon_model, config, device,
+            icp_window=args.icp_window,
+            icp_max_corr_dist=args.icp_max_corr_dist,
+            icp_fitness_threshold=args.icp_fitness_threshold,
+        )
     print(f"reconstructed point cloud: {len(pcd.points)} points")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
