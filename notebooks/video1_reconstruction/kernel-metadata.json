@@ -1,0 +1,16 @@
+{
+  "id": "ritiksharma8/endoslam-video1-reconstruction",
+  "title": "endoslam-video1-reconstruction",
+  "code_file": "video1_reconstruction.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["ritiksharma8/endoslam-video1-sample"],
+  "competition_sources": [],
+  "kernel_sources": [
+    "ritiksharma8/endoslam-phase2-darkir-training",
+    "ritiksharma8/endoslam-phase3-mini3drecon-training"
+  ]
+}
