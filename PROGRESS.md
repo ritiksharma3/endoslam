@@ -333,26 +333,38 @@ beyond Phase 4's qualitative spot-check is unverified. Treat output as a
 demo until real footage is evaluated against real GT the way Phase 5 did
 for the synthetic domain.
 
-**One-time local setup** (needed once, before the CLI can run):
+**One-time local setup — done (2026-08-14).**
 1. `git clone https://github.com/cidautai/DarkIR.git DarkIR_upstream` at
    the repo root — `build_darkir_lite()` needs this on `sys.path`
-   (`DARKIR_PATH` env var, defaults to `"DarkIR_upstream"` relative to cwd).
-   Gitignored (`/DarkIR_upstream/`) — same repo every training/eval
-   notebook's setup cell clones fresh on Kaggle, now persistent locally
-   instead.
-2. Download both trained checkpoints once: `kaggle kernels output
-   ritiksharma8/endoslam-phase2-darkir-training -p <path>` and
-   `.../endoslam-phase3-mini3drecon-training -p <path>`, then pass their
-   `epoch_*.pt` paths to `--darkir-checkpoint`/`--mini-recon-checkpoint`.
-3. `pip install -r environment/requirements.txt` locally.
+   (`DARKIR_PATH` env var, defaults to `"DarkIR_upstream"` relative to cwd,
+   confirmed working with no env var needed as long as the CLI runs from
+   the repo root). Gitignored (`/DarkIR_upstream/`) — same repo every
+   training/eval notebook's setup cell clones fresh on Kaggle, now
+   persistent locally instead.
+2. Downloaded both trained checkpoints: `checkpoints/phase2_darkir/checkpoints/epoch_19.pt`
+   and `checkpoints/phase3_mini_recon/checkpoints/epoch_39.pt` (via `kaggle
+   kernels output <kernel> -p <path> --file-pattern "epoch_..\.pt"` —
+   note `--file-pattern` is a **regex**, not a shell glob; deleted the 19
+   intermediate Phase 2 epoch checkpoints after, keeping only the final
+   one, ~40MB each). `checkpoints/` is already gitignored.
+3. `pip install -r environment/requirements.txt` locally — everything was
+   already installed except `tensorboard`, which pulled in `protobuf
+   7.35.1` and broke version constraints for unrelated tools already on
+   this machine (`streamlit`, `google-api-core`, etc.) — `tensorboard`
+   isn't actually imported by the inference CLI (it's a training-logging
+   dependency), so uninstalled it and pinned `protobuf==4.25.8` back down
+   to satisfy everyone. `pip check` confirmed no conflicts.
 
 Validated locally: `build_windows()` against a synthetic frame tensor
 (matches `EndoSLAMStomachDataset._build_windows()`'s window count/content,
-including the shorter-than-one-window edge case) and `reconstruct_video()`
+including the shorter-than-one-window edge case); `reconstruct_video()`
 end-to-end against synthetic frames with a real (untrained) `MiniReconModel`
-and a shape-enforcing DarkIR stand-in — produces a non-empty point cloud
-without crashing. Not yet run against a real video file or the real trained
-checkpoints (needs the one-time local setup above first).
+and a shape-enforcing DarkIR stand-in; and then **again with the real
+trained checkpoints** (both loaded with 0 missing/unexpected keys,
+`strict=True`) end-to-end against synthetic frames on CPU — produced a
+non-empty point cloud (303,657 points) without crashing. **The CLI is fully
+set up and verified locally.** Only remaining step is running it against an
+actual endoscope video file, which the user will provide.
 
 ## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
 
@@ -660,3 +672,17 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   end-to-end validation against an actual video + the trained checkpoints
   is still pending the one-time local setup (clone `DarkIR_upstream`,
   download both checkpoints).
+- 2026-08-14: Ran the one-time local setup. Cloned `DarkIR_upstream`;
+  downloaded both checkpoints via `kaggle kernels output --file-pattern`
+  (learned the hard way it's a regex, not a glob — first attempt with
+  `"epoch_*.pt"` silently matched nothing). `pip install`ing
+  `requirements.txt` pulled in `tensorboard`, which upgraded `protobuf` to
+  7.35.1 and broke version constraints for unrelated tools already on this
+  machine (`streamlit`, `google-api-core`) — `tensorboard` isn't actually
+  used by the inference CLI, so uninstalled it and pinned
+  `protobuf==4.25.8` back down; `pip check` confirmed clean afterward.
+  Verified both checkpoints load with `strict=True` (0 missing/unexpected
+  keys) and the full pipeline runs end-to-end on CPU against synthetic
+  frames with the real trained weights, producing a real point cloud.
+  **The video-to-pointcloud CLI is fully set up and ready** — next step is
+  the user's: run it against an actual endoscope video.
