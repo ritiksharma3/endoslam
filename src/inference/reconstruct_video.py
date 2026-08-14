@@ -1,0 +1,228 @@
+"""
+End-to-end: a real endoscope video file -> DarkIR-lite enhancement ->
+Mini-3D-Recon depth+pose -> fused Open3D point cloud. This is the project's
+literal README.md contract ("Input: dark, low-quality endoscope video.
+Output: a rotatable 3D point cloud"), finally exercised against an arbitrary
+video file rather than EndoSLAMStomachDataset's pre-extracted, pre-windowed
+benchmark frames -- reuses the exact same trained models and fusion code
+Phases 2-5 already validated (src/darkir_lite/model.py,
+src/reconstruction/model.py, src/fusion/{intrinsics,backproject,pointcloud}.py,
+src/reconstruction/geometry.py), just with a new frame source.
+
+Two real differences from src/fusion/reconstruct.py's reconstruct_predicted()
+(the Phase 4 benchmark version this mirrors):
+
+1. DarkIR-lite always runs first (Phase 5 proved this wins on every
+   metric -- see REPORT.md). Each window's frames go into DarkIR-lite as its
+   batch dimension directly (DarkIR has no notion of a temporal window,
+   unlike Mini-3D-Recon) -- the exact convention fixed in
+   src/eval/run_comparison.py after the original version crashed on a 5D
+   tensor. Point-cloud colors come from the *enhanced* frame, not the raw
+   dark one -- the whole point is a legible reconstruction of genuinely dark
+   footage, and the enhanced frame is what a viewer should see.
+2. No ground truth exists for an arbitrary video (unlike the benchmark),
+   so the pose chain is anchored at the identity matrix (world origin =
+   camera pose at frame 0), not a GT pose. Absolute scale of the resulting
+   point cloud is therefore whatever Mini-3D-Recon's raw, uncalibrated
+   translation units happen to be for this video -- meaningful for
+   shape/relative geometry, not real-world distances (same caveat already
+   documented for Phase 3/4/5's raw UnityCam world-units).
+
+DOMAIN GAP CAVEAT: Mini-3D-Recon was trained exclusively on synthetic
+UnityCam depth+pose ground truth (see PROGRESS.md) -- it has never been
+supervised against a real endoscope frame (real HighCam/LowCam sequences
+were excluded from Phase 3 training over an unresolved coordinate-frame/
+scale mismatch). Running this on real video works end-to-end without
+crashing, but depth/pose *quality* on real footage beyond Phase 4's
+qualitative spot-check is unverified -- treat the output as a demo, not a
+validated measurement, until real footage is evaluated against real GT the
+way Phase 5 did for the synthetic domain.
+"""
+
+import argparse
+import os
+
+import cv2
+import numpy as np
+import open3d as o3d
+import torch
+import yaml
+
+from src.common.device import select_device
+from src.darkir_lite.model import build_darkir_lite
+from src.fusion.backproject import backproject_depth, transform_points_to_world
+from src.fusion.intrinsics import depth_byte_to_unity_units, fov_to_intrinsics
+from src.fusion.pointcloud import accumulate_point_cloud, apply_depth_trunc_mask
+from src.reconstruction.geometry import absolute_poses_from_relative
+from src.reconstruction.model import MiniReconModel
+
+
+def load_video_frames(
+    video_path: str,
+    image_size: tuple[int, int],
+    frame_stride: int = 1,
+    max_frames: int | None = None,
+) -> torch.Tensor:
+    """video_path -> (N,3,H,W) float32 [0,1] RGB tensor. Same preprocessing
+    EndoSLAMStomachDataset.__getitem__ already applies to every frame
+    (cv2.resize -> BGR2RGB -> /255.0), so frames match what the models were
+    trained on. frame_stride/max_frames are pragmatic escape hatches for
+    long videos -- the whole result is held in memory at once, no
+    chunked/streaming processing (same tradeoff run_comparison.py already
+    makes for the benchmark's full test split)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"could not open video: {video_path}")
+
+    frames = []
+    idx = 0
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            if idx % frame_stride == 0:
+                frame_bgr = cv2.resize(frame_bgr, image_size)
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                frames.append(torch.from_numpy(frame_rgb).permute(2, 0, 1))
+                if max_frames and len(frames) >= max_frames:
+                    break
+            idx += 1
+    finally:
+        cap.release()
+
+    if not frames:
+        raise ValueError(f"no frames decoded from {video_path}")
+    return torch.stack(frames)
+
+
+def build_windows(frames: torch.Tensor, context_window: int) -> list[torch.Tensor]:
+    """(N,3,H,W) -> list of (T,3,H,W) stride-1 windows. Mirrors
+    EndoSLAMStomachDataset._build_windows() exactly (same
+    range(0, max(1, N - context_window + 1)) formula) so window composition
+    matches what Mini-3D-Recon was trained on."""
+    n = frames.shape[0]
+    return [frames[start:start + context_window] for start in range(0, max(1, n - context_window + 1))]
+
+
+@torch.no_grad()
+def reconstruct_video(
+    frames: torch.Tensor,
+    darkir_model: torch.nn.Module,
+    mini_recon_model: torch.nn.Module,
+    config: dict,
+    device: str,
+) -> o3d.geometry.PointCloud:
+    """frames: (N,3,H,W) clean-or-dark [0,1] RGB (see load_video_frames).
+    Runs DarkIR-lite -> Mini-3D-Recon per window, chains predicted relative
+    poses from an identity anchor (no GT exists for an arbitrary video),
+    backprojects, and fuses into one point cloud. Structurally mirrors
+    src/fusion/reconstruct.py's reconstruct_predicted() -- see this module's
+    docstring for the two real differences (DarkIR-in-the-loop, identity
+    anchor)."""
+    fcfg = config["fusion"]
+    H, W = tuple(config["data"]["image_size"])
+    fx, fy, cx, cy = fov_to_intrinsics(fcfg["camera_fov_deg"], (H, W))
+    context_window = config["reconstruction"]["context_window"]
+
+    windows = build_windows(frames, context_window)
+    n = len(windows)
+
+    darkir_model.eval()
+    mini_recon_model.eval()
+
+    all_depths: list[np.ndarray] = []
+    all_colors: list[np.ndarray] = []
+    all_rotations: list[torch.Tensor] = []
+    all_translations: list[torch.Tensor] = []
+
+    for i in range(n):
+        window = windows[i]  # (T,3,H,W)
+
+        # DarkIR is a per-frame model expecting (B,3,H,W) -- the window's T
+        # frames go in as its batch dimension directly, not wrapped in an
+        # extra unsqueeze(0) (that produced an invalid 5D tensor, see this
+        # module's docstring and PROGRESS.md's Phase 5 log).
+        enhanced = darkir_model(window.to(device)).clamp(0.0, 1.0)  # (T,3,H,W)
+
+        pred = mini_recon_model(enhanced.unsqueeze(0))  # (1,T,3,H,W) -> dict
+        depth = pred["depth"][0]              # (T,H,W)
+        rotation = pred["rotation"][0]         # (T-1,3,3)
+        translation = pred["translation"][0]   # (T-1,3)
+        enhanced_cpu = enhanced.cpu()
+
+        if i < n - 1:
+            all_depths.append(depth[0].cpu().numpy())
+            all_colors.append(enhanced_cpu[0].permute(1, 2, 0).numpy())
+            all_rotations.append(rotation[0].cpu())
+            all_translations.append(translation[0].cpu())
+        else:
+            for t in range(depth.shape[0]):
+                all_depths.append(depth[t].cpu().numpy())
+                all_colors.append(enhanced_cpu[t].permute(1, 2, 0).numpy())
+            for t in range(rotation.shape[0]):
+                all_rotations.append(rotation[t].cpu())
+                all_translations.append(translation[t].cpu())
+
+    rotations = torch.stack(all_rotations)
+    translations = torch.stack(all_translations)
+    pose0 = torch.eye(4)  # no GT for an arbitrary video -- world origin = frame 0's camera pose
+    absolute_poses = absolute_poses_from_relative(pose0, rotations, translations).numpy()
+
+    def frame_iter():
+        for i, depth_byte in enumerate(all_depths):
+            depth_units = depth_byte_to_unity_units(depth_byte, fcfg["near_clip"], fcfg["far_clip"])
+            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
+            points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
+            points_world = transform_points_to_world(points_cam[mask], absolute_poses[i])
+            colors = all_colors[i][mask]
+            yield points_world, colors
+
+    return accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reconstruct a 3D point cloud from an endoscope video")
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--darkir-checkpoint", required=True)
+    parser.add_argument("--mini-recon-checkpoint", required=True)
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--output", default="outputs/reconstruction.ply")
+    parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--no-view", action="store_true", help="skip popping the interactive Open3D window")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    device = select_device()
+    print(f"device: {device}")
+
+    image_size = tuple(config["data"]["image_size"])
+    frames = load_video_frames(args.video, image_size, frame_stride=args.frame_stride, max_frames=args.max_frames)
+    print(f"loaded {frames.shape[0]} frames from {args.video}")
+
+    darkir_model = build_darkir_lite(pretrained=False).to(device)
+    darkir_checkpoint = torch.load(args.darkir_checkpoint, map_location=device, weights_only=False)
+    darkir_model.load_state_dict(darkir_checkpoint["model_state_dict"])
+
+    mini_recon_model = MiniReconModel(
+        pretrained=False, depth_head_channels=config["reconstruction"]["depth_head_channels"]
+    ).to(device)
+    mini_recon_checkpoint = torch.load(args.mini_recon_checkpoint, map_location=device, weights_only=False)
+    mini_recon_model.load_state_dict(mini_recon_checkpoint["model_state_dict"])
+
+    pcd = reconstruct_video(frames, darkir_model, mini_recon_model, config, device)
+    print(f"reconstructed point cloud: {len(pcd.points)} points")
+
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    o3d.io.write_point_cloud(args.output, pcd)
+    print(f"saved: {args.output}")
+
+    if not args.no_view:
+        o3d.visualization.draw_geometries([pcd])
+
+
+if __name__ == "__main__":
+    main()

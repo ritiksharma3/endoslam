@@ -296,6 +296,64 @@ All 6 phases (0-5) are now done. The project's core hypothesis (brightening
 first improves reconstruction) is confirmed with numbers — see `REPORT.md`.
 Remaining work, if any, is polish/extension, not a required next phase.
 
+## Video-to-pointcloud CLI (2026-08-14)
+
+Every phase above only ever ran against `EndoSLAMStomachDataset` — benchmark
+frames with known GT depth/pose. README.md's actual stated contract
+("Input: dark, low-quality endoscope video. Output: a rotatable 3D point
+cloud") had never been exercised against a real video file. Added
+`src/inference/reconstruct_video.py` to close that gap — not a numbered
+phase (0-5 are already complete), a usability addition on top of them.
+
+Runs as a **local CLI** (`python -m src.inference.reconstruct_video
+--video ... --darkir-checkpoint ... --mini-recon-checkpoint ...`), not a
+Kaggle notebook — both models are small (~3M + ~3.3M params) and this is
+inference-only, so CPU is fine. Structurally mirrors
+`src/fusion/reconstruct.py`'s `reconstruct_predicted()` (same window
+iteration trick, same backprojection/fusion calls), with two real
+differences: DarkIR-lite always runs before Mini-3D-Recon (Phase 5 proved
+this wins on every metric — no toggle), using the batch convention fixed in
+`src/eval/run_comparison.py` (the window's frames as DarkIR's batch
+dimension directly, not wrapped in an extra `unsqueeze(0)`); and the pose
+chain is anchored at identity, not a GT pose, since an arbitrary video has
+none — so the point cloud's absolute scale is whatever Mini-3D-Recon's raw
+uncalibrated units are for that video, same caveat as everywhere else raw
+translation units show up in this project. Point-cloud colors come from the
+DarkIR-enhanced frame, not the raw dark one, for a legible viewer output.
+Output is a `.ply` file plus (unless `--no-view`) an interactive Open3D
+window popped open locally — the first time an interactive viewer is
+possible in this project at all, since every prior phase only ever ran on
+headless Kaggle.
+
+**Domain-gap caveat, stated plainly**: Mini-3D-Recon was trained
+exclusively on synthetic UnityCam depth+pose ground truth — it has never
+been supervised against a real endoscope frame. This CLI will run on real
+video end-to-end without crashing, but depth/pose *quality* on real footage
+beyond Phase 4's qualitative spot-check is unverified. Treat output as a
+demo until real footage is evaluated against real GT the way Phase 5 did
+for the synthetic domain.
+
+**One-time local setup** (needed once, before the CLI can run):
+1. `git clone https://github.com/cidautai/DarkIR.git DarkIR_upstream` at
+   the repo root — `build_darkir_lite()` needs this on `sys.path`
+   (`DARKIR_PATH` env var, defaults to `"DarkIR_upstream"` relative to cwd).
+   Gitignored (`/DarkIR_upstream/`) — same repo every training/eval
+   notebook's setup cell clones fresh on Kaggle, now persistent locally
+   instead.
+2. Download both trained checkpoints once: `kaggle kernels output
+   ritiksharma8/endoslam-phase2-darkir-training -p <path>` and
+   `.../endoslam-phase3-mini3drecon-training -p <path>`, then pass their
+   `epoch_*.pt` paths to `--darkir-checkpoint`/`--mini-recon-checkpoint`.
+3. `pip install -r environment/requirements.txt` locally.
+
+Validated locally: `build_windows()` against a synthetic frame tensor
+(matches `EndoSLAMStomachDataset._build_windows()`'s window count/content,
+including the shorter-than-one-window edge case) and `reconstruct_video()`
+end-to-end against synthetic frames with a real (untrained) `MiniReconModel`
+and a shape-enforcing DarkIR stand-in — produces a non-empty point cloud
+without crashing. Not yet run against a real video file or the real trained
+checkpoints (needs the one-time local setup above first).
+
 ## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
 
 Ran `phase5_evaluation.ipynb` on Kaggle (GPU off, inference-only, UnityCam
@@ -592,3 +650,13 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   this project are now complete.** The project's core hypothesis
   (brightening first improves reconstruction) is confirmed with real
   numbers on held-out data.
+- 2026-08-14: User asked for the actual README.md contract — a real video
+  file in, a 3D point cloud out — since every phase so far only ran against
+  the benchmark dataset. Added `src/inference/reconstruct_video.py` as a
+  local CLI (not a Kaggle notebook — inference-only, both models are small
+  enough for CPU). See "Video-to-pointcloud CLI" above for full detail.
+  Validated `build_windows()` and `reconstruct_video()` locally against
+  synthetic frames/an untrained model before considering this done — real
+  end-to-end validation against an actual video + the trained checkpoints
+  is still pending the one-time local setup (clone `DarkIR_upstream`,
+  download both checkpoints).

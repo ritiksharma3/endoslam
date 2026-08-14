@@ -7,6 +7,11 @@ __pycache__/
 .venv/
 venv/
 
+# DarkIR upstream repo -- prior phases only ever cloned this inside an
+# ephemeral Kaggle container; local CLI usage (src/inference/reconstruct_video.py)
+# clones it into this persistent working directory instead.
+/DarkIR_upstream/
+
 # data (never commit dataset contents; Kaggle mounts it, don't mirror it here)
 /data/
 *.ckpt
