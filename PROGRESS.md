@@ -391,6 +391,46 @@ benchmark numbers in `REPORT.md`. Confirms the CLI itself works correctly
 end-to-end on real input; does not confirm reconstruction quality on real
 video, which was never claimed.
 
+**`--best-frame` mode added (2026-08-14).** The full-video blob result
+above is partly the domain gap, but also compounded by pose-chain drift
+across ~200 chained predicted relative poses on out-of-domain footage. User
+asked for a mode that reconstructs only the single sharpest/best-lit frame
+instead — no pose chain, so no drift to accumulate: a single view's own
+camera frame trivially *is* the world frame. Added to
+`src/inference/reconstruct_video.py`:
+- `frame_quality_score()` — Laplacian-variance sharpness + a brightness
+  validity gate that rejects near-black/blown-out frames but does **not**
+  penalize ordinary darkness (that's DarkIR-lite's job to fix; penalizing
+  darkness in frame selection would work against the whole project).
+- `select_best_frame()` — **streams** the video frame-by-frame (unlike
+  `load_video_frames()`, which buffers the whole decoded video as one
+  float32 tensor — fine for the ~200-frame sample but would be several GB
+  for the user's real ~2-minute video, never exercised at that length).
+  Keeps only the running-best frame in memory.
+- `reconstruct_single_frame()` — confirmed locally first that
+  `MiniReconModel` accepts a `T=1` window cleanly (PoseHead's pair
+  concatenation just produces an empty 0-length tensor, no crash) — then
+  DarkIR-enhances the one frame, runs it through Mini-3D-Recon as a T=1
+  window, backprojects with an identity pose (no `accumulate_point_cloud`
+  voxel-merge needed for a single view).
+- `--best-frame` CLI flag; also bundled saving a static matplotlib preview
+  PNG unconditionally alongside the `.ply` (`{output}_preview.png`) — the
+  interactive Open3D viewer failed to get a working OpenGL/WGL context when
+  launched from this automated execution environment (confirmed: point
+  cloud loaded correctly, `GLFW Error: WGL: Failed to make context
+  current`), so a GL-independent fallback is now always generated, not just
+  produced ad hoc after the fact.
+
+Validated: unit test plants a known-sharp frame among blurred/near-black/
+blown-out ones in a real encoded test video, confirms `select_best_frame`
+picks exactly the planted one and rejects the invalid ones, and confirms
+darkness alone doesn't disqualify a frame. Ran `--best-frame` against the
+real stomach sample with the real trained checkpoints: picked frame 156
+(sharpness score 244.9), 14,298 points. **Visually a coherent smooth
+surface patch — a real, clear improvement over the full-video blob.**
+Trade-off is expected and inherent: one partial view instead of a fused
+multi-frame reconstruction.
+
 ## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
 
 Ran `phase5_evaluation.ipynb` on Kaggle (GPU off, inference-only, UnityCam
@@ -725,3 +765,18 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   than the clean tube shape Phase 4 got on synthetic data — expected given
   the already-documented domain gap (Mini-3D-Recon never trained on real
   footage), not a bug. See "Video-to-pointcloud CLI" above for full detail.
+- 2026-08-14: Tried the interactive Open3D viewer for real — failed with
+  `GLFW Error: WGL: Failed to make context current` (point cloud loaded
+  fine, 1,417,411 points; just no working OpenGL context in this automated
+  execution environment). User then asked for a "best frame" mode instead
+  of the full-video reconstruction, aiming to fix the blob result. Added
+  `--best-frame` to `reconstruct_video.py` (sharpness+brightness frame
+  scoring, streamed video scan, single-view T=1 reconstruction, no pose
+  chain) plus an always-generated static preview PNG (GL-independent
+  fallback for the viewer issue above). Validated with a unit test (planted
+  sharp frame correctly picked out of blurred/invalid ones) and a real run
+  against the stomach sample with the real checkpoints: frame 156 selected,
+  14,298 points, **visually a coherent smooth surface — a real improvement
+  over the full-video blob.** See "Video-to-pointcloud CLI" above for full
+  detail. Next: user has a real ~2-minute `.avi` endoscope video to run
+  this against — waiting on the file path.
