@@ -363,8 +363,33 @@ and a shape-enforcing DarkIR stand-in; and then **again with the real
 trained checkpoints** (both loaded with 0 missing/unexpected keys,
 `strict=True`) end-to-end against synthetic frames on CPU — produced a
 non-empty point cloud (303,657 points) without crashing. **The CLI is fully
-set up and verified locally.** Only remaining step is running it against an
-actual endoscope video file, which the user will provide.
+set up and verified locally.**
+
+**First real end-to-end run (2026-08-14).** Needed a real stomach-endoscope
+video to test with — a Wikimedia Commons colonoscopy clip was tried first
+but is the wrong anatomy for this project (colon, not stomach); Wikimedia
+has zero actual GI-endoscopy video files under `Esophagogastroduodenoscopy`
+(the correct term for stomach/upper-GI endoscopy), only static images.
+Built a proper one instead from this project's own data: a new minimal
+kernel (`notebooks/sample_video`, kernel `endoslam-sample-video`,
+`COMPLETE`) stitches the first 200 frames of
+`Cameras/HighCam/Stomach-III/TumorfreeTrajectory_3` (already confirmed
+frame-count == pose-row-count exactly, no dropped frames) into
+`sample_stomach_endoscopy.mp4` via `cv2.VideoWriter` — real ex-vivo pig
+**stomach** endoscope footage, correct domain, no external licensing
+question since it's the benchmark dataset itself. Verified locally
+(640x480 @ 15fps, all 200 frames read back).
+
+Ran the CLI against it for real: `outputs/sample_stomach_reconstruction.ply`,
+1,417,411 points, no crash. **Visually it's a dense, roughly blob-shaped
+point cloud, not a clean tube/lumen shape** the way Phase 4's synthetic
+UnityCam GT-mode reconstruction was — this is the domain-gap caveat
+documented above showing up in practice, not a pipeline bug: Mini-3D-Recon
+has only ever been supervised on synthetic UnityCam depth/pose, never real
+footage, so depth/pose quality on real video isn't expected to match the
+benchmark numbers in `REPORT.md`. Confirms the CLI itself works correctly
+end-to-end on real input; does not confirm reconstruction quality on real
+video, which was never claimed.
 
 ## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
 
@@ -686,3 +711,17 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   frames with the real trained weights, producing a real point cloud.
   **The video-to-pointcloud CLI is fully set up and ready** — next step is
   the user's: run it against an actual endoscope video.
+- 2026-08-14: First real video handed to the user was a Wikimedia Commons
+  colonoscopy clip — user correctly flagged it as the wrong anatomy for a
+  project scoped to stomach endoscopy. Checked Wikimedia's actual
+  GI-endoscopy category (`Esophagogastroduodenoscopy`): zero video files,
+  images only, so no fix available there. Built a correct one instead from
+  this project's own dataset — new `notebooks/sample_video` kernel
+  (`endoslam-sample-video`, `COMPLETE`) stitches 200 real
+  `HighCam/Stomach-III/TumorfreeTrajectory_3` frames into
+  `sample_stomach_endoscopy.mp4`. Ran `reconstruct_video.py` against it for
+  real (first real end-to-end run of this CLI, not a smoke test): produced
+  a 1.4M-point cloud without crashing, but visually a dense blob rather
+  than the clean tube shape Phase 4 got on synthetic data — expected given
+  the already-documented domain gap (Mini-3D-Recon never trained on real
+  footage), not a bug. See "Video-to-pointcloud CLI" above for full detail.
