@@ -780,3 +780,28 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   over the full-video blob.** See "Video-to-pointcloud CLI" above for full
   detail. Next: user has a real ~2-minute `.avi` endoscope video to run
   this against — waiting on the file path.
+- 2026-08-14: Ran `--best-frame` against the user's real video
+  (`sample_videos/Video1.avi`, gitignored, not committed) — first run of
+  this whole project against genuinely external, non-benchmark clinical
+  footage. Confirmed `cv2.VideoCapture` opens it first (720x576, 25fps,
+  VC-1/`WVC1` codec, ~3006 frames/~120s per container metadata — AVI
+  container itself needed no special handling). Selected frame 727
+  (sharpness score 1138.9) from the full ~3000-frame scan, reconstructed
+  30,592 points, coherent smooth-surface shape again (not a blob) —
+  `--best-frame`'s benefit holds on a second, independent real video.
+
+  Two real observations from inspecting the actual source frame
+  (`outputs/video1_frame727_raw.png`), not bugs, both about this specific
+  video's characteristics: (1) it's genuine clinical chromoendoscopy
+  (blue/cyan-enhanced mucosal imaging, a real diagnostic technique, not a
+  color artifact) — matches the recorded point cloud's coloring exactly.
+  (2) the raw frame has an on-screen equipment HUD burned into the pixels
+  (bitrate/timestamp text, black octagonal vignette mask around the actual
+  tissue view) — `reconstruct_single_frame()` has no way to distinguish
+  overlay/vignette pixels from real tissue, so those regions likely got
+  backprojected as spurious geometry too, visible as a wavy/scalloped
+  fringe around the point cloud's edges in the preview. Not fixed here
+  (out of scope for this request) — a future improvement would crop the
+  vignette/HUD region before feeding frames to either model, if
+  reconstructing HUD-overlaid clinical recordings becomes a real use case
+  rather than a one-off test.
