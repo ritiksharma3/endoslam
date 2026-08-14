@@ -25,3 +25,8 @@ checkpoints/
 # outputs
 outputs/
 *.log
+
+# sample/test videos for src/inference/reconstruct_video.py -- downloaded/
+# generated locally, not project source, don't mirror external or
+# dataset-derived video content here
+/sample_videos/

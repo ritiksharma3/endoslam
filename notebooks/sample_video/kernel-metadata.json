@@ -1,0 +1,13 @@
+{
+  "id": "ritiksharma8/endoslam-sample-video",
+  "title": "endoslam-sample-video",
+  "code_file": "sample_video.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["mcocoz/endoslam"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
