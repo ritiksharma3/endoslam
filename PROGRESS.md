@@ -45,7 +45,7 @@ checklist, as work progresses.
 | 2 | 5-10 | DarkIR-lite fine-tuned from pretrained checkpoint, PSNR/SSIM logged | **Done.** Full 20-epoch fine-tune completed in a single Kaggle session on GPU (kernel `endoslam-phase2-darkir-training`, `COMPLETE`, 2026-08-13) — no resume cycle needed. Final checkpoint `epoch_19.pt`: `global_step=43240` (= 2162 steps/epoch x 20, exact), **val_psnr=32.40, val_ssim=0.9226** — up from the 20-step smoke test's 23.68/0.772. Checkpoint left in Kaggle kernel output only (not committed to the repo); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase2-darkir-training` when Phase 3/4 need the trained weights. |
 | 3 | 10-20 | Mini-3D-Recon trained on UnityCam depth+pose GT | **Done.** `MiniReconModel` (MobileNetV3-Small backbone + depth/pose heads, ~3M params) trained the full 40 epochs in one Kaggle session (kernel `endoslam-phase3-mini3drecon-training`, `COMPLETE`, 2026-08-13) — no resume needed. Final checkpoint `epoch_39.pt`: `global_step=12280` (= 307 steps/epoch x 40, exact), **val_depth_absrel=0.118, val_rot_err_deg=0.46°, val_trans_err=0.00357** (raw UnityCam world-units) — all improved sharply from the smoke test's 0.93/14.50°/0.031. Checkpoint left in Kaggle kernel output only (not committed); re-fetch via `kaggle kernels output ritiksharma8/endoslam-phase3-mini3drecon-training` when Phase 4 needs it. |
 | 4 | 20-25 | Pose chaining + depth backprojection -> Open3D point cloud viewer | **Done.** Kernel `endoslam-phase4-reconstruction`, `COMPLETE` — GT-mode reconstruction produced a coherent stomach-lumen tube shape (not scattered), passing the empirical gate for the sourced-but-unconfirmed camera model. See "Phase 4 reconstruction run" below. |
-| 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | Not started. |
+| 5 | 25-30 | With/without-DarkIR comparison, ATE/RPE + AbsRel/RMSE, report | **Done.** Kernel `endoslam-phase5-evaluation` v2, `COMPLETE` — `darkir_lite_enhanced` beat `raw_dark_input` on every metric (AbsRel -30%, RMSE -34%, delta1 +71% relative, ATE -20%, RPE trans -38%, RPE rot -48%). See `REPORT.md` and "Phase 5 evaluation run" below. |
 
 ## Real EndoSLAM layout (confirmed, replaces all earlier guesses)
 
@@ -289,7 +289,47 @@ outcome once run.
    `src/eval/run_comparison.py` (raw-dark vs DarkIR-enhanced input through
    the trained Mini-3D-Recon model on the UnityCam test split, fixed-seed
    degradation so both conditions see identical dark input), run on Kaggle,
-   then write the final `REPORT.md`.
+   then write the final `REPORT.md`. **Done** — see "Phase 5 evaluation run"
+   below and `REPORT.md`.
+
+All 6 phases (0-5) are now done. The project's core hypothesis (brightening
+first improves reconstruction) is confirmed with numbers — see `REPORT.md`.
+Remaining work, if any, is polish/extension, not a required next phase.
+
+## Phase 5 evaluation run (2026-08-14, `endoslam-phase5-evaluation` kernel)
+
+Ran `phase5_evaluation.ipynb` on Kaggle (GPU off, inference-only, UnityCam
+test split = 148 windows).
+
+- **v1 failed**: `ValueError: too many values to unpack (expected 4)` inside
+  `DarkIR.forward()`'s `_, _, H, W = input.shape`. Root cause:
+  `run_comparison.py` called `darkir_model(dark_images.unsqueeze(0)...)`,
+  copying `MiniReconModel`'s `(B,T,3,H,W)` temporal-window calling
+  convention onto DarkIR, which has no notion of a temporal window and
+  expects plain `(B,3,H,W)` (same as `darkir_lite/train.py` already calls
+  it) — the extra `unsqueeze(0)` produced an invalid 5D tensor. Fixed by
+  passing the window's `T` frames as DarkIR's batch dimension directly. The
+  local smoke test hadn't caught this because its DarkIR stand-in
+  (`nn.Identity()`) doesn't enforce a shape contract — strengthened the
+  smoke test to assert 4D input, matching DarkIR's real constraint, so this
+  class of bug is now caught locally next time.
+- **v2 (`COMPLETE`)**: every metric improved with `darkir_lite_enhanced`
+  over `raw_dark_input` — depth AbsRel 0.327->0.227 (-30.4%), RMSE
+  11.011->7.244 (-34.2%), delta1 0.398->0.680 (+71% relative), ATE
+  0.00724->0.00582 (-19.6%), RPE translation RMSE 0.001546->0.000963
+  (-37.7%), RPE rotation RMSE 1.127°->0.582° (-48.4%). Preview triplets
+  (dark | DarkIR-enhanced | clean GT) show the enhanced frame visually close
+  to the clean reference in all 3 sampled examples. Full numbers in
+  `phase5_metrics.json` (not committed — regenerate via the notebook);
+  preview images copied into `report/previews/` and committed alongside
+  `REPORT.md`.
+- Also fixed a real bug in `src/data/dark_degradation.py` found via local
+  testing before this run: `random_motion_blur_kernel()` used the global
+  `np.random` state for its blur angle instead of the `rng` parameter
+  `degrade_frame()` already threaded through everywhere else — meant
+  `degrade_frame(..., rng=seeded_rng)` wasn't actually fully deterministic,
+  which would have broken Phase 5's "both conditions see identical dark
+  input" fairness requirement silently.
 
 ## Phase 4 reconstruction run (2026-08-13, `endoslam-phase4-reconstruction` kernel)
 
@@ -531,3 +571,24 @@ scatter, 3 orthographic views each — headless-safe, no OpenGL dependency).
   preview PNGs satisfy the "point cloud viewer" deliverable given headless
   Kaggle. **Phase 4 is done.** Next: Phase 5 (with/without-DarkIR
   comparison, ATE/RPE + AbsRel/RMSE/delta1, report).
+- 2026-08-14: Implemented and ran Phase 5. `src/eval/metrics.py`
+  (median-ratio depth AbsRel/RMSE/delta1, Umeyama-aligned ATE/RPE) and
+  `src/eval/run_comparison.py` validated locally first (synthetic fixtures
+  + a fake in-memory dataset) before spending Kaggle quota — this caught
+  two real bugs: `dark_degradation.random_motion_blur_kernel()` ignoring
+  its `rng` parameter (fixed, see "Phase 5 evaluation run" above), and
+  `trajectory_metrics()`'s original RPE not correcting for the scale offset
+  between predicted (raw uncalibrated units) and GT trajectories (fixed by
+  scale-correcting translations before the relative-pose differencing).
+  First Kaggle run (v1) still failed — a third bug local testing didn't
+  catch: `run_comparison.py` called DarkIR with `MiniReconModel`'s temporal
+  batching convention instead of DarkIR's own per-frame one, fixed and
+  smoke test strengthened to catch this class of bug locally next time.
+  v2 `COMPLETE`: **`darkir_lite_enhanced` beat `raw_dark_input` on every
+  metric** (AbsRel -30.4%, RMSE -34.2%, delta1 +71% relative, ATE -19.6%,
+  RPE translation -37.7%, RPE rotation -48.4%) on the 148-window UnityCam
+  test split. Wrote `REPORT.md` with the full metrics table and 3 preview
+  triplets (`report/previews/`). **Phase 5 is done — all 6 phases (0-5) of
+  this project are now complete.** The project's core hypothesis
+  (brightening first improves reconstruction) is confirmed with real
+  numbers on held-out data.
