@@ -67,7 +67,7 @@ from src.common.device import select_device
 from src.darkir_lite.model import build_darkir_lite
 from src.fusion.backproject import backproject_depth, transform_points_to_world
 from src.fusion.intrinsics import depth_byte_to_unity_units, fov_to_intrinsics
-from src.fusion.pointcloud import accumulate_point_cloud, apply_depth_trunc_mask
+from src.fusion.pointcloud import DEFAULT_DOWNSAMPLE_EVERY, accumulate_point_cloud, apply_depth_trunc_mask
 from src.reconstruction.model import MiniReconModel
 
 
@@ -117,6 +117,31 @@ def build_windows(frames: torch.Tensor, context_window: int) -> list[torch.Tenso
     matches what Mini-3D-Recon was trained on."""
     n = frames.shape[0]
     return [frames[start:start + context_window] for start in range(0, max(1, n - context_window + 1))]
+
+
+@torch.no_grad()
+def enhance_all_frames(
+    frames: torch.Tensor, darkir_model: torch.nn.Module, device: str, batch_size: int = 8
+) -> torch.Tensor:
+    """DarkIR-lite has no temporal dependency -- it enhances each frame
+    independently, regardless of which window it's later grouped into.
+    build_windows() below produces stride-1 overlapping windows, so without
+    this, reconstruct_video()'s per-window loop would run every physical
+    frame through DarkIR-lite up to `context_window` (8) times (once per
+    window it appears in) for a single used output. Enhancing every frame
+    exactly once here, then slicing windows out of the cached result,
+    removes that redundant compute without changing DarkIR-lite's output
+    (eval-mode batching doesn't affect per-sample results) or touching
+    Mini-3D-Recon's windowed forward pass at all. Returned on CPU -- an
+    (N,3,H,W) float32 tensor for a multi-thousand-frame video is sized to
+    hold in RAM (same tradeoff load_video_frames() already makes for the
+    raw frames), individual windows are moved to `device` on use."""
+    darkir_model.eval()
+    chunks = []
+    for start in range(0, frames.shape[0], batch_size):
+        chunk = frames[start:start + batch_size].to(device)
+        chunks.append(darkir_model(chunk).clamp(0.0, 1.0).cpu())
+    return torch.cat(chunks, dim=0)
 
 
 def frame_quality_score(frame: np.ndarray, dark_min: float = 0.02, bright_max: float = 0.95) -> tuple[float, bool]:
@@ -291,6 +316,62 @@ def refine_pose_icp(
     return result.transformation, result.fitness
 
 
+def save_reconstruction_checkpoint(
+    checkpoint_path: str,
+    frame_index: int,
+    absolute_pose: np.ndarray,
+    reference_window: deque,
+    n_fused: int,
+    n_corrected: int,
+    accumulated: o3d.geometry.PointCloud,
+) -> None:
+    """Saves reconstruct_video()'s complete fusion-loop state -- the pose
+    chain, the ICP reference window, the fused/corrected counters, AND the
+    accumulated point cloud -- as one file, so a killed multi-hour Kaggle
+    run loses nothing past the last checkpoint instead of the entire run.
+    Deliberately one file, not two (an earlier version split the point
+    cloud into its own .ply written from a separate call site): a crash
+    between two separate writes leaves them permanently inconsistent --
+    whichever order they're written in, resuming from the newer file paired
+    with the older one either re-fuses already-fused frames (duplicate
+    points) or skips a range entirely (a gap) -- and there's no way to
+    detect the mismatch after the fact from the files themselves. Writing
+    to a temp path and os.replace()-ing it into place makes the single
+    checkpoint file's update atomic: a crash mid-write leaves the *previous*
+    checkpoint fully intact, never a half-written one."""
+    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+    tmp_path = checkpoint_path + ".tmp"
+    torch.save(
+        {
+            "frame_index": frame_index,
+            "absolute_pose": absolute_pose,
+            "reference_window": list(reference_window),
+            "n_fused": n_fused,
+            "n_corrected": n_corrected,
+            "points": np.asarray(accumulated.points),
+            "colors": np.asarray(accumulated.colors),
+        },
+        tmp_path,
+    )
+    os.replace(tmp_path, checkpoint_path)
+
+
+def load_reconstruction_checkpoint(checkpoint_path: str, icp_window: int):
+    """Returns (frame_index, absolute_pose, reference_window, n_fused,
+    n_corrected, accumulated_pcd) -- everything reconstruct_video() needs
+    to resume its fusion loop right after `frame_index` instead of from
+    frame 0."""
+    state = torch.load(checkpoint_path, weights_only=False)
+    reference_window = deque(state["reference_window"], maxlen=icp_window)
+    accumulated = o3d.geometry.PointCloud()
+    accumulated.points = o3d.utility.Vector3dVector(state["points"])
+    accumulated.colors = o3d.utility.Vector3dVector(state["colors"])
+    return (
+        state["frame_index"], state["absolute_pose"], reference_window,
+        state["n_fused"], state["n_corrected"], accumulated,
+    )
+
+
 @torch.no_grad()
 def reconstruct_video(
     frames: torch.Tensor,
@@ -301,6 +382,9 @@ def reconstruct_video(
     icp_window: int = 15,
     icp_max_corr_dist: float | None = None,
     icp_fitness_threshold: float = 0.3,
+    checkpoint_path: str | None = None,
+    checkpoint_every: int | None = None,
+    resume: bool = False,
 ) -> o3d.geometry.PointCloud:
     """frames: (N,3,H,W) clean-or-dark [0,1] RGB (see load_video_frames).
     Runs DarkIR-lite -> Mini-3D-Recon per window (unchanged from before),
@@ -325,7 +409,18 @@ def reconstruct_video(
     scored on the *raw* pre-DarkIR frame, since enhancement can make a
     genuinely-degenerate frame look artificially sharp) still advance the
     pose chain, so the next frame's initial guess stays sane, but don't
-    contribute points to the fused cloud or the ICP reference window."""
+    contribute points to the fused cloud or the ICP reference window.
+
+    checkpoint_path/checkpoint_every/resume: periodically (every
+    `checkpoint_every` fused frames, rounded up to the nearest multiple of
+    accumulate_point_cloud's DEFAULT_DOWNSAMPLE_EVERY -- see that
+    function's docstring for why) persist the fusion loop's state (pose
+    chain, ICP reference window, accumulated point cloud) to
+    checkpoint_path so a killed/interrupted run can continue with --resume
+    instead of restarting from frame 0. Only the fusion loop is
+    checkpointed -- the forward-pass phase above (DarkIR-lite +
+    Mini-3D-Recon) always reruns in full on resume, which is fine given how
+    much cheaper Fix 2's dedupe made it."""
     fcfg = config["fusion"]
     H, W = tuple(config["data"]["image_size"])
     fx, fy, cx, cy = fov_to_intrinsics(fcfg["camera_fov_deg"], (H, W))
@@ -333,10 +428,28 @@ def reconstruct_video(
     icp_max_corr_dist = icp_max_corr_dist or fcfg["voxel_downsample"] * 10
     icp_voxel_size = fcfg["voxel_downsample"] * 4  # coarser than the final fusion voxel size -- ICP is expensive
 
-    windows = build_windows(frames, context_window)
+    if checkpoint_every:
+        # must land on the same cadence accumulate_point_cloud() actually
+        # checkpoints at (see its docstring) so the pose-state and
+        # point-cloud checkpoints always describe the same fused-frame
+        # count -- otherwise a resume would double-fuse or drop frames.
+        checkpoint_every = -(-checkpoint_every // DEFAULT_DOWNSAMPLE_EVERY) * DEFAULT_DOWNSAMPLE_EVERY
+
+    resume_state = None
+    if resume and checkpoint_path and os.path.isfile(checkpoint_path):
+        resume_state = load_reconstruction_checkpoint(checkpoint_path, icp_window)
+        print(f"reconstruct_video: resuming from checkpoint at frame {resume_state[0]} "
+              f"({resume_state[3]} frames already fused)")
+
+    # DarkIR-enhance every physical frame exactly once (see
+    # enhance_all_frames()'s docstring) instead of re-enhancing each frame
+    # up to `context_window` times as it recurs across overlapping windows.
+    enhanced_frames = enhance_all_frames(
+        frames, darkir_model, device, batch_size=config["darkir_lite"]["batch_size"]
+    )
+    windows = build_windows(enhanced_frames, context_window)
     n = len(windows)
 
-    darkir_model.eval()
     mini_recon_model.eval()
 
     all_depths: list[np.ndarray] = []
@@ -346,41 +459,53 @@ def reconstruct_video(
     all_translations: list[torch.Tensor] = []
 
     for i in range(n):
-        window = windows[i]  # (T,3,H,W)
+        enhanced_cpu = windows[i]  # (T,3,H,W), already DarkIR-enhanced, on CPU
 
-        # DarkIR is a per-frame model expecting (B,3,H,W) -- the window's T
-        # frames go in as its batch dimension directly, not wrapped in an
-        # extra unsqueeze(0) (that produced an invalid 5D tensor, see this
-        # module's docstring and PROGRESS.md's Phase 5 log).
-        enhanced = darkir_model(window.to(device)).clamp(0.0, 1.0)  # (T,3,H,W)
-
-        pred = mini_recon_model(enhanced.unsqueeze(0))  # (1,T,3,H,W) -> dict
+        pred = mini_recon_model(enhanced_cpu.unsqueeze(0).to(device))  # (1,T,3,H,W) -> dict
         depth = pred["depth"][0]              # (T,H,W)
         rotation = pred["rotation"][0]         # (T-1,3,3)
         translation = pred["translation"][0]   # (T-1,3)
-        enhanced_cpu = enhanced.cpu()
 
         if i < n - 1:
             all_depths.append(depth[0].cpu().numpy())
             all_colors.append(enhanced_cpu[0].permute(1, 2, 0).numpy())
-            all_valid.append(frame_quality_score(window[0].permute(1, 2, 0).numpy())[1])
+            # quality-scored on the raw pre-DarkIR frame (see docstring below) --
+            # window i's position 0 is always raw frame i under stride-1 windowing.
+            all_valid.append(frame_quality_score(frames[i].permute(1, 2, 0).numpy())[1])
             all_rotations.append(rotation[0].cpu())
             all_translations.append(translation[0].cpu())
         else:
             for t in range(depth.shape[0]):
                 all_depths.append(depth[t].cpu().numpy())
                 all_colors.append(enhanced_cpu[t].permute(1, 2, 0).numpy())
-                all_valid.append(frame_quality_score(window[t].permute(1, 2, 0).numpy())[1])
+                all_valid.append(frame_quality_score(frames[i + t].permute(1, 2, 0).numpy())[1])
             for t in range(rotation.shape[0]):
                 all_rotations.append(rotation[t].cpu())
                 all_translations.append(translation[t].cpu())
 
-    def frame_iter():
-        absolute_pose = np.eye(4)
-        reference_window: deque = deque(maxlen=icp_window)
-        n_fused, n_corrected = 0, 0
+    # Updated right before every yield below, read back by the
+    # accumulate_point_cloud() on_checkpoint callback at the bottom of this
+    # function -- checkpointing both the pose-chain state and the point
+    # cloud from that single call site (instead of frame_iter() saving its
+    # own state independently) means a crash can only ever leave both
+    # checkpoint files describing the last *fully processed* fused frame,
+    # never the pose state ahead of the point cloud it should match.
+    last_yielded_state: dict = {}
 
-        for i, depth_byte in enumerate(all_depths):
+    def frame_iter():
+        if resume_state:
+            start_i = resume_state[0] + 1
+            absolute_pose = resume_state[1]
+            reference_window: deque = resume_state[2]
+            n_fused, n_corrected = resume_state[3], resume_state[4]
+        else:
+            start_i = 0
+            absolute_pose = np.eye(4)
+            reference_window: deque = deque(maxlen=icp_window)
+            n_fused, n_corrected = 0, 0
+
+        for i in range(start_i, len(all_depths)):
+            depth_byte = all_depths[i]
             if i > 0:
                 relative = np.eye(4)
                 relative[:3, :3] = all_rotations[i - 1].numpy()
@@ -408,13 +533,35 @@ def reconstruct_video(
             if all_valid[i]:
                 reference_window.append(points_world)
                 n_fused += 1
+                if checkpoint_path:
+                    last_yielded_state.update(
+                        i=i, absolute_pose=absolute_pose.copy(),
+                        reference_window=deque(reference_window, maxlen=icp_window),
+                        n_fused=n_fused, n_corrected=n_corrected,
+                    )
                 yield points_world, colors
 
         print(f"reconstruct_video: fused {n_fused}/{len(all_depths)} frames "
               f"({n_corrected} ICP-corrected, icp_window={icp_window}, "
               f"icp_fitness_threshold={icp_fitness_threshold})")
 
-    return accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
+    def on_checkpoint(_i: int, pcd: o3d.geometry.PointCloud) -> None:
+        save_reconstruction_checkpoint(
+            checkpoint_path,
+            last_yielded_state["i"], last_yielded_state["absolute_pose"],
+            last_yielded_state["reference_window"],
+            last_yielded_state["n_fused"], last_yielded_state["n_corrected"],
+            pcd,
+        )
+
+    return accumulate_point_cloud(
+        frame_iter(),
+        voxel_size=fcfg["voxel_downsample"],
+        initial=resume_state[5] if resume_state else None,
+        start_count=resume_state[3] if resume_state else 0,
+        checkpoint_every=checkpoint_every if checkpoint_path else None,
+        on_checkpoint=on_checkpoint if checkpoint_path else None,
+    )
 
 
 def main():
@@ -438,6 +585,16 @@ def main():
     parser.add_argument("--icp-fitness-threshold", type=float, default=0.3,
                          help="full-video mode only: minimum ICP fitness to trust a pose correction; below this, "
                               "fall back to the network's raw predicted pose")
+    parser.add_argument("--checkpoint-path", default=None,
+                         help="full-video mode only: file to periodically save fusion-loop state to (pose "
+                              "chain, ICP window, accumulated point cloud, written atomically as one file), "
+                              "so a killed run can continue with --resume instead of restarting from frame 0")
+    parser.add_argument("--checkpoint-every", type=int, default=None,
+                         help="full-video mode only: save a checkpoint every N fused frames "
+                              "(requires --checkpoint-path); config.yaml's reconstruction.checkpoint_every_steps "
+                              "is used if not set")
+    parser.add_argument("--resume", action="store_true",
+                         help="full-video mode only: resume from --checkpoint-path if it exists")
     parser.add_argument("--no-view", action="store_true", help="skip popping the interactive Open3D window")
     args = parser.parse_args()
 
@@ -470,6 +627,9 @@ def main():
             icp_window=args.icp_window,
             icp_max_corr_dist=args.icp_max_corr_dist,
             icp_fitness_threshold=args.icp_fitness_threshold,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_every=args.checkpoint_every or config["reconstruction"]["checkpoint_every_steps"],
+            resume=args.resume,
         )
     print(f"reconstructed point cloud: {len(pcd.points)} points")
 
