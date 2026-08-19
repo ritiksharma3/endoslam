@@ -65,6 +65,7 @@ import yaml
 
 from src.common.device import select_device
 from src.darkir_lite.model import build_darkir_lite
+from src.fusion import bundle_adjust
 from src.fusion.backproject import backproject_depth, transform_points_to_world
 from src.fusion.intrinsics import depth_byte_to_unity_units, fov_to_intrinsics
 from src.fusion.pointcloud import DEFAULT_DOWNSAMPLE_EVERY, accumulate_point_cloud, apply_depth_trunc_mask
@@ -316,6 +317,166 @@ def refine_pose_icp(
     return result.transformation, result.fitness
 
 
+def collect_keyframe_correspondences(
+    keyframe_points: list[np.ndarray],
+    keyframe_poses: list[np.ndarray],
+    max_correspondence_distance: float,
+    fitness_threshold: float,
+    loop_closure_radius: float,
+    candidate_limit: int,
+) -> list[tuple[int, int, np.ndarray]]:
+    """For the newest entry in keyframe_points (index len(...)-1), finds ICP
+    correspondences against the immediately preceding keyframe (chain
+    continuity) plus up to `candidate_limit` earlier keyframes whose
+    ICP-chain position is within loop_closure_radius of the new keyframe's
+    position -- proximity-based loop-closure candidate search (O(K) distance
+    checks per new keyframe, not exhaustive O(K^2) pairwise ICP), so the
+    eventual bundle-adjustment stage can see revisits from anywhere earlier
+    in the video, not just reconstruct_video()'s existing icp_window.
+
+    Deliberately separate from refine_pose_icp()'s existing per-frame
+    correction: that call matches against a downsampled *concatenation* of
+    several reference frames, so its correspondence_set indices can't be
+    traced back to one specific frame's own points. Each call here compares
+    exactly two keyframes' own (already index-tracked, see
+    bundle_adjust.voxel_downsample_with_index) point sets, so indices map
+    unambiguously back into keyframe_points[i]/[j]. Returns
+    [(i, j, correspondence_array), ...]."""
+    new_idx = len(keyframe_points) - 1
+    if new_idx == 0 or len(keyframe_points[new_idx]) == 0:
+        return []
+
+    new_pos = keyframe_poses[new_idx][:3, 3]
+    loop_candidates = [
+        j for j in range(new_idx - 1)
+        if np.linalg.norm(keyframe_poses[j][:3, 3] - new_pos) < loop_closure_radius
+    ]
+    candidates = [new_idx - 1] + loop_candidates[:candidate_limit]
+
+    out = []
+    for j in candidates:
+        if len(keyframe_points[j]) == 0:
+            continue
+        source = o3d.geometry.PointCloud()
+        source.points = o3d.utility.Vector3dVector(keyframe_points[new_idx])
+        target = o3d.geometry.PointCloud()
+        target.points = o3d.utility.Vector3dVector(keyframe_points[j])
+        target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(
+            radius=max_correspondence_distance, max_nn=30))
+        result = o3d.pipelines.registration.registration_icp(
+            source, target, max_correspondence_distance, np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        )
+        if result.fitness >= fitness_threshold and len(result.correspondence_set) > 0:
+            # registration_icp(source, target, ...).correspondence_set is
+            # (source_index, target_index) pairs -- source is keyframe_points[new_idx],
+            # target is keyframe_points[j], so the tuple's (i, j) order must match that,
+            # not (j, new_idx): build_tracks_from_correspondences indexes col 0 into
+            # keyframe_points_xyz[i] and col 1 into keyframe_points_xyz[j].
+            out.append((new_idx, j, np.asarray(result.correspondence_set)))
+    return out
+
+
+def correct_keyframe_depth_scale(
+    depth_units: np.ndarray,
+    mask: np.ndarray,
+    absolute_pose: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float, y_down: bool,
+    reference_points: np.ndarray,
+    icp_voxel_size: float,
+    icp_max_corr_dist: float,
+    ransac_cfg: dict,
+) -> tuple[np.ndarray, float, float]:
+    """RANSAC depth scale/shift alignment (bundle_adjust.ransac_depth_scale_shift)
+    for a new keyframe against the immediately-preceding keyframe's own
+    already-placed points, applied BEFORE this keyframe's points become BA
+    landmarks. This is the only scale-drift correction in the project that
+    needs no ground truth -- src/eval/metrics.py's Umeyama/median-ratio
+    corrections only run at eval time against GT. A cheap single-candidate
+    ICP (source subsampled to <=2000 points for speed) finds correspondences
+    to drive the fit; on failure (no overlap), returns depth unchanged."""
+    points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=y_down)
+    masked_points_cam = points_cam[mask]
+    masked_depth = depth_units[mask]
+    n_masked = len(masked_points_cam)
+    if n_masked == 0 or len(reference_points) == 0:
+        return depth_units, 1.0, 0.0
+
+    stride = max(1, n_masked // 2000)
+    sel = np.arange(0, n_masked, stride)
+    points_world = transform_points_to_world(masked_points_cam[sel], absolute_pose)
+
+    source = o3d.geometry.PointCloud()
+    source.points = o3d.utility.Vector3dVector(points_world)
+    target = o3d.geometry.PointCloud()
+    target.points = o3d.utility.Vector3dVector(reference_points)
+    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_voxel_size * 2, max_nn=30))
+    result = o3d.pipelines.registration.registration_icp(
+        source, target, icp_max_corr_dist, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+    )
+    corr = np.asarray(result.correspondence_set)
+    if len(corr) < 2:
+        return depth_units, 1.0, 0.0
+
+    raw_depth_samples = masked_depth[sel][corr[:, 0]]
+    R, t = absolute_pose[:3, :3], absolute_pose[:3, 3]
+    ref_cam = (reference_points[corr[:, 1]] - t) @ R  # world -> this keyframe's camera space
+    implied_depth_samples = ref_cam[:, 2]
+
+    scale, shift, _ = bundle_adjust.ransac_depth_scale_shift(
+        raw_depth_samples, implied_depth_samples,
+        n_iters=ransac_cfg["n_iters"], inlier_threshold=ransac_cfg["inlier_threshold"],
+    )
+    return np.clip(scale * depth_units + shift, 0.0, None), scale, shift
+
+
+def rerun_fusion_with_corrected_poses(
+    all_depths: list[np.ndarray],
+    all_colors: list[np.ndarray],
+    all_valid: list[bool],
+    fused_original_poses: list[np.ndarray],
+    keyframe_fused_index: list[int],
+    original_keyframe_poses: np.ndarray,
+    ba_keyframe_poses: np.ndarray,
+    fcfg: dict,
+    fx: float, fy: float, cx: float, cy: float,
+) -> o3d.geometry.PointCloud:
+    """Re-runs backprojection + fusion (existing, unchanged pointcloud.py/
+    backproject.py code) using bundle-adjustment-corrected keyframe poses.
+    Every fused frame's corrected pose is obtained by rigidly re-anchoring it
+    to its nearest preceding keyframe:
+        corrected = ba_pose[k] @ inverse(original_pose[k]) @ original_pose[frame]
+    i.e. BA's per-keyframe correction is propagated onto the frames around it
+    via the *original* (already fine-grained-ICP-refined) relative motion
+    between them, rather than interpolating a new one -- exact for every
+    fused frame, keyframe or not, no interpolation approximation needed."""
+    corrections = [
+        ba_keyframe_poses[k] @ np.linalg.inv(original_keyframe_poses[k])
+        for k in range(len(original_keyframe_poses))
+    ]
+
+    def frame_iter():
+        fused_i = 0
+        kf_ptr = 0
+        for i, valid in enumerate(all_valid):
+            if not valid:
+                continue
+            while kf_ptr + 1 < len(keyframe_fused_index) and keyframe_fused_index[kf_ptr + 1] <= fused_i:
+                kf_ptr += 1
+            corrected_pose = corrections[kf_ptr] @ fused_original_poses[fused_i]
+
+            depth_units = depth_byte_to_unity_units(all_depths[i], fcfg["near_clip"], fcfg["far_clip"])
+            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
+            points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
+            points_world = transform_points_to_world(points_cam[mask], corrected_pose)
+            colors = all_colors[i][mask]
+            fused_i += 1
+            yield points_world, colors
+
+    return accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
+
+
 def save_reconstruction_checkpoint(
     checkpoint_path: str,
     frame_index: int,
@@ -385,6 +546,7 @@ def reconstruct_video(
     checkpoint_path: str | None = None,
     checkpoint_every: int | None = None,
     resume: bool = False,
+    bundle_adjust_enabled: bool = False,
 ) -> o3d.geometry.PointCloud:
     """frames: (N,3,H,W) clean-or-dark [0,1] RGB (see load_video_frames).
     Runs DarkIR-lite -> Mini-3D-Recon per window (unchanged from before),
@@ -420,8 +582,24 @@ def reconstruct_video(
     instead of restarting from frame 0. Only the fusion loop is
     checkpointed -- the forward-pass phase above (DarkIR-lite +
     Mini-3D-Recon) always reruns in full on resume, which is fine given how
-    much cheaper Fix 2's dedupe made it."""
+    much cheaper Fix 2's dedupe made it.
+
+    bundle_adjust_enabled (Phase 6, default off, every other parameter/path
+    above is unaffected by it): after the incremental fusion above completes,
+    optionally runs src/fusion/bundle_adjust.py's global sparse bundle
+    adjustment over a sparse set of keyframes (every
+    config.yaml bundle_adjustment.keyframe_stride-th fused frame) to correct
+    the drift the sliding-window ICP above structurally cannot -- it only
+    ever sees the last `icp_window` frames, never a revisit from far earlier
+    in the video (see this module's docstring / PROGRESS.md). If bundle
+    adjustment's cost improvement clears bundle_adjustment.
+    rollback_min_improvement, the whole point cloud is re-fused (see
+    rerun_fusion_with_corrected_poses()) with the corrected poses; otherwise
+    the ICP-chain-only result above is returned completely unchanged.
+    NOTE: not resume-aware -- a resumed run's bundle adjustment only sees
+    keyframes captured during *this* invocation (a warning is printed)."""
     fcfg = config["fusion"]
+    ba_cfg = config.get("bundle_adjustment", {})  # only required when bundle_adjust_enabled=True
     H, W = tuple(config["data"]["image_size"])
     fx, fy, cx, cy = fov_to_intrinsics(fcfg["camera_fov_deg"], (H, W))
     context_window = config["reconstruction"]["context_window"]
@@ -440,6 +618,9 @@ def reconstruct_video(
         resume_state = load_reconstruction_checkpoint(checkpoint_path, icp_window)
         print(f"reconstruct_video: resuming from checkpoint at frame {resume_state[0]} "
               f"({resume_state[3]} frames already fused)")
+        if bundle_adjust_enabled:
+            print("reconstruct_video: WARNING -- bundle_adjust_enabled with --resume only sees "
+                  "keyframes captured during this invocation, not the pre-resume portion of the video")
 
     # DarkIR-enhance every physical frame exactly once (see
     # enhance_all_frames()'s docstring) instead of re-enhancing each frame
@@ -492,6 +673,19 @@ def reconstruct_video(
     # never the pose state ahead of the point cloud it should match.
     last_yielded_state: dict = {}
 
+    # Phase 6 bundle-adjustment bookkeeping (unused, zero overhead, unless
+    # bundle_adjust_enabled). pixel_grid matches backproject_depth's own
+    # (u, v) meshgrid convention, so pixel_grid[mask] aligns index-for-index
+    # with points_cam[mask] below -- needed to give BA's landmark
+    # observations real (u, v) pixel coordinates, not just 3D positions.
+    pixel_grid = np.stack(np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64)), axis=-1)
+    keyframe_points: list[np.ndarray] = []
+    keyframe_pixels: list[np.ndarray] = []
+    keyframe_poses: list[np.ndarray] = []
+    keyframe_fused_index: list[int] = []
+    pairwise_correspondences: list[tuple[int, int, np.ndarray]] = []
+    fused_original_poses: list[np.ndarray] = []
+
     def frame_iter():
         if resume_state:
             start_i = resume_state[0] + 1
@@ -532,6 +726,28 @@ def reconstruct_video(
 
             if all_valid[i]:
                 reference_window.append(points_world)
+                fused_original_poses.append(absolute_pose.copy())
+
+                if bundle_adjust_enabled and (len(fused_original_poses) - 1) % ba_cfg["keyframe_stride"] == 0:
+                    is_first_keyframe = len(keyframe_points) == 0
+                    kf_points_world = points_world
+                    if not is_first_keyframe and ba_cfg["ransac_scale_shift"]["enabled"]:
+                        corrected_depth, _, _ = correct_keyframe_depth_scale(
+                            depth_units, mask, absolute_pose, fx, fy, cx, cy, fcfg["depth_axis_y_down"],
+                            keyframe_points[-1], icp_voxel_size, icp_max_corr_dist, ba_cfg["ransac_scale_shift"],
+                        )
+                        corrected_cam = backproject_depth(corrected_depth, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
+                        kf_points_world = transform_points_to_world(corrected_cam[mask], absolute_pose)
+                    idx = bundle_adjust.voxel_downsample_with_index(kf_points_world, icp_voxel_size)
+                    keyframe_points.append(kf_points_world[idx])
+                    keyframe_pixels.append(pixel_grid[mask][idx])
+                    keyframe_poses.append(absolute_pose.copy())
+                    keyframe_fused_index.append(len(fused_original_poses) - 1)
+                    pairwise_correspondences.extend(collect_keyframe_correspondences(
+                        keyframe_points, keyframe_poses, icp_max_corr_dist, icp_fitness_threshold,
+                        ba_cfg["loop_closure_radius"], ba_cfg["loop_closure_candidates"],
+                    ))
+
                 n_fused += 1
                 if checkpoint_path:
                     last_yielded_state.update(
@@ -554,7 +770,7 @@ def reconstruct_video(
             pcd,
         )
 
-    return accumulate_point_cloud(
+    pcd = accumulate_point_cloud(
         frame_iter(),
         voxel_size=fcfg["voxel_downsample"],
         initial=resume_state[5] if resume_state else None,
@@ -562,6 +778,24 @@ def reconstruct_video(
         checkpoint_every=checkpoint_every if checkpoint_path else None,
         on_checkpoint=on_checkpoint if checkpoint_path else None,
     )
+
+    if bundle_adjust_enabled and len(keyframe_points) >= 2:
+        original_keyframe_poses = np.stack(keyframe_poses)
+        ba_result = bundle_adjust.refine_trajectory(
+            original_keyframe_poses, keyframe_points, keyframe_pixels,
+            pairwise_correspondences, (fx, fy, cx, cy), ba_cfg,
+        )
+        print(f"reconstruct_video: bundle adjustment over {len(keyframe_points)} keyframes -- "
+              f"accepted={ba_result['accepted']} diagnostics={ba_result['diagnostics']}")
+        if ba_result["accepted"]:
+            pcd = rerun_fusion_with_corrected_poses(
+                all_depths, all_colors, all_valid, fused_original_poses, keyframe_fused_index,
+                original_keyframe_poses, ba_result["poses"], fcfg, fx, fy, cx, cy,
+            )
+    elif bundle_adjust_enabled:
+        print(f"reconstruct_video: bundle adjustment skipped -- only {len(keyframe_points)} keyframe(s) captured")
+
+    return pcd
 
 
 def main():
@@ -595,6 +829,16 @@ def main():
                               "is used if not set")
     parser.add_argument("--resume", action="store_true",
                          help="full-video mode only: resume from --checkpoint-path if it exists")
+    parser.add_argument("--bundle-adjust", action="store_true",
+                         help="full-video mode only: after ICP-chain fusion completes, run global sparse bundle "
+                              "adjustment (Phase 6, src/fusion/bundle_adjust.py) over keyframes to correct drift "
+                              "the sliding-window ICP above can't (no loop closure past --icp-window frames). "
+                              "Default off; only replaces the output if it clears config.yaml's "
+                              "bundle_adjustment.rollback_min_improvement, so this can never make output worse "
+                              "than the existing ICP-chain-only result. Tunables live in config.yaml's "
+                              "bundle_adjustment block, not as CLI flags -- this is a new feature, config-only "
+                              "until real runs show a need for per-invocation overrides (same reasoning "
+                              "--icp-window etc. only became flags after active Phase 4 tuning)")
     parser.add_argument("--no-view", action="store_true", help="skip popping the interactive Open3D window")
     args = parser.parse_args()
 
@@ -630,6 +874,7 @@ def main():
             checkpoint_path=args.checkpoint_path,
             checkpoint_every=args.checkpoint_every or config["reconstruction"]["checkpoint_every_steps"],
             resume=args.resume,
+            bundle_adjust_enabled=args.bundle_adjust,
         )
     print(f"reconstructed point cloud: {len(pcd.points)} points")
 

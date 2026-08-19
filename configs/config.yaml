@@ -79,3 +79,27 @@ eval:
   pose_metrics: ["ATE", "RPE"]
   depth_metrics: ["AbsRel", "RMSE", "delta1"]
   compare_conditions: ["raw_dark_input", "darkir_lite_enhanced"]
+
+bundle_adjustment:
+  # Phase 6: optional global refinement over reconstruct_video()'s full-video
+  # keyframe poses (src/fusion/bundle_adjust.py), gated by --bundle-adjust
+  # (default off) -- see that module's docstring and PROGRESS.md's "sliding-
+  # window ICP only catches local revisits" note for why this exists.
+  keyframe_stride: 8          # every Nth fused frame becomes a BA node/keyframe
+  loop_closure_radius: 0.05   # unity world-units; earlier keyframes within this distance of a
+                               # new keyframe's ICP-chain position become loop-closure candidates
+  loop_closure_candidates: 3  # max earlier keyframes checked per new keyframe, beyond the immediately
+                               # preceding one (bounds cost -- proximity search, not exhaustive pairwise)
+  robust_loss: "soft_l1"      # scipy.optimize.least_squares loss= (pseudo-Huber-equivalent)
+  f_scale: 1.0                # robust loss transition scale, in pixel-reprojection units
+  max_nfev: 200                # TRF solver iteration cap per outer iteration, bounds Kaggle CPU runtime
+  max_outer_iters: 3          # outer solve/re-filter iterations (bounded iterative optimization w/ rollback)
+  mad_outlier_threshold: 3.5  # modified-z-score convention, observations beyond this get dropped between outer iters
+  baseline_anchor_weight: 1.0 # gauge/scale-anchoring residual weight (keeps BA's trajectory arc length
+                               # near the pre-BA ICP-chain's own, since reprojection-only BA is scale-ambiguous)
+  rollback_min_improvement: 0.01  # BA must beat the pre-BA ICP-chain cost by >1%, or its result is discarded
+                                    # entirely and reconstruct_video()'s existing output is returned unchanged
+  ransac_scale_shift:
+    enabled: true
+    n_iters: 200
+    inlier_threshold: 0.02    # unity depth units, same scale as fusion.voxel_downsample
