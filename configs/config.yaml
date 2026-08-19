@@ -91,11 +91,16 @@ bundle_adjustment:
   # keyframe poses (src/fusion/bundle_adjust.py), gated by --bundle-adjust
   # (default off) -- see that module's docstring and PROGRESS.md's "sliding-
   # window ICP only catches local revisits" note for why this exists.
-  keyframe_stride: 8          # every Nth fused frame becomes a BA node/keyframe
-  loop_closure_radius: 0.05   # unity world-units; earlier keyframes within this distance of a
-                               # new keyframe's ICP-chain position become loop-closure candidates
-  loop_closure_candidates: 3  # max earlier keyframes checked per new keyframe, beyond the immediately
-                               # preceding one (bounds cost -- proximity search, not exhaustive pairwise)
+  keyframe_stride: 4          # every Nth fused frame becomes a BA node/keyframe -- was 8; halved for finer
+                               # correction resolution after a real 200-frame run still showed a separated
+                               # branch that denser keyframes/wider loop closure below are meant to catch
+  loop_closure_radius: 0.15   # unity world-units; earlier keyframes within this distance of a new keyframe's
+                               # ICP-chain position become loop-closure candidates -- was 0.05, too tight to
+                               # even attempt matching a real revisit whose pre-BA drift already exceeded it
+                               # (the observed separated-branch offset was in this same 0.05-0.1 ballpark)
+  loop_closure_candidates: 6  # max earlier keyframes checked per new keyframe, beyond the immediately
+                               # preceding one (bounds cost -- proximity search, not exhaustive pairwise) --
+                               # was 3, doubled since the wider radius above surfaces more candidates to check
   robust_loss: "soft_l1"      # scipy.optimize.least_squares loss= (pseudo-Huber-equivalent)
   f_scale: 1.0                # robust loss transition scale, in pixel-reprojection units
   max_nfev: 200                # TRF solver iteration cap per outer iteration, bounds Kaggle CPU runtime
