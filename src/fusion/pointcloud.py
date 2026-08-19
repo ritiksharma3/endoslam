@@ -15,6 +15,25 @@ def apply_depth_trunc_mask(depth_units: np.ndarray, depth_trunc: float, depth_mi
     return (depth_units > depth_min) & (depth_units <= depth_trunc)
 
 
+def apply_border_mask(raw_color: np.ndarray, min_brightness: float) -> np.ndarray:
+    """(H, W, 3) RGB [0,1] float -> (H, W) bool mask, True where mean
+    brightness clears min_brightness. Real endoscope footage (unlike
+    UnityCam's synthetic frames, which have no such artifact) has a solid
+    black circular vignette outside the lens's field of view -- pixels the
+    network was never trained on, whose predicted depth is essentially
+    noise. Left unmasked, these show up as a visually distracting scattered
+    black "shell" in the fused cloud, and -- worse -- get treated as real
+    geometry by ICP/bundle-adjustment correspondence matching, which can
+    corrupt pose estimates against physically-meaningless border geometry.
+    Evaluated against the *raw* pre-enhancement frame, same reasoning as
+    frame_quality_score() in reconstruct_video.py: DarkIR-lite enhancement
+    can unpredictably alter a hard optical vignette's brightness (it's
+    out-of-distribution input, zero real signal to recover), so a threshold
+    on the enhanced frame would be unreliable frame-to-frame; the raw
+    frame's vignette is a fixed hardware artifact, consistently near-zero."""
+    return raw_color.mean(axis=-1) > min_brightness
+
+
 def accumulate_point_cloud(
     frame_iter,
     voxel_size: float,

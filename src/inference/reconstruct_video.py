@@ -68,7 +68,12 @@ from src.darkir_lite.model import build_darkir_lite
 from src.fusion import bundle_adjust
 from src.fusion.backproject import backproject_depth, transform_points_to_world
 from src.fusion.intrinsics import depth_byte_to_unity_units, fov_to_intrinsics
-from src.fusion.pointcloud import DEFAULT_DOWNSAMPLE_EVERY, accumulate_point_cloud, apply_depth_trunc_mask
+from src.fusion.pointcloud import (
+    DEFAULT_DOWNSAMPLE_EVERY,
+    accumulate_point_cloud,
+    apply_border_mask,
+    apply_depth_trunc_mask,
+)
 from src.reconstruction.model import MiniReconModel
 
 
@@ -245,7 +250,10 @@ def reconstruct_single_frame(
     color = enhanced[0].permute(1, 2, 0).cpu().numpy()  # (H,W,3)
 
     depth_units = depth_byte_to_unity_units(depth, fcfg["near_clip"], fcfg["far_clip"])
-    mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
+    raw_color = frame.permute(1, 2, 0).cpu().numpy()  # pre-DarkIR -- see apply_border_mask()'s docstring for why
+    mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"]) & apply_border_mask(
+        raw_color, fcfg["border_min_brightness"]
+    )
     points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
     points_world = points_cam[mask]  # identity pose -- camera frame IS world frame, no transform needed
     colors = color[mask]
@@ -435,6 +443,7 @@ def rerun_fusion_with_corrected_poses(
     all_depths: list[np.ndarray],
     all_colors: list[np.ndarray],
     all_valid: list[bool],
+    all_border_masks: list[np.ndarray],
     fused_original_poses: list[np.ndarray],
     keyframe_fused_index: list[int],
     original_keyframe_poses: np.ndarray,
@@ -467,7 +476,7 @@ def rerun_fusion_with_corrected_poses(
             corrected_pose = corrections[kf_ptr] @ fused_original_poses[fused_i]
 
             depth_units = depth_byte_to_unity_units(all_depths[i], fcfg["near_clip"], fcfg["far_clip"])
-            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
+            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"]) & all_border_masks[i]
             points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
             points_world = transform_points_to_world(points_cam[mask], corrected_pose)
             colors = all_colors[i][mask]
@@ -636,6 +645,7 @@ def reconstruct_video(
     all_depths: list[np.ndarray] = []
     all_colors: list[np.ndarray] = []
     all_valid: list[bool] = []
+    all_border_masks: list[np.ndarray] = []
     all_rotations: list[torch.Tensor] = []
     all_translations: list[torch.Tensor] = []
 
@@ -650,16 +660,21 @@ def reconstruct_video(
         if i < n - 1:
             all_depths.append(depth[0].cpu().numpy())
             all_colors.append(enhanced_cpu[0].permute(1, 2, 0).numpy())
-            # quality-scored on the raw pre-DarkIR frame (see docstring below) --
+            # quality-scored/border-masked on the raw pre-DarkIR frame (see
+            # frame_quality_score()'s and apply_border_mask()'s docstrings) --
             # window i's position 0 is always raw frame i under stride-1 windowing.
-            all_valid.append(frame_quality_score(frames[i].permute(1, 2, 0).numpy())[1])
+            raw_i = frames[i].permute(1, 2, 0).numpy()
+            all_valid.append(frame_quality_score(raw_i)[1])
+            all_border_masks.append(apply_border_mask(raw_i, fcfg["border_min_brightness"]))
             all_rotations.append(rotation[0].cpu())
             all_translations.append(translation[0].cpu())
         else:
             for t in range(depth.shape[0]):
                 all_depths.append(depth[t].cpu().numpy())
                 all_colors.append(enhanced_cpu[t].permute(1, 2, 0).numpy())
-                all_valid.append(frame_quality_score(frames[i + t].permute(1, 2, 0).numpy())[1])
+                raw_it = frames[i + t].permute(1, 2, 0).numpy()
+                all_valid.append(frame_quality_score(raw_it)[1])
+                all_border_masks.append(apply_border_mask(raw_it, fcfg["border_min_brightness"]))
             for t in range(rotation.shape[0]):
                 all_rotations.append(rotation[t].cpu())
                 all_translations.append(translation[t].cpu())
@@ -707,7 +722,7 @@ def reconstruct_video(
                 absolute_pose = absolute_pose @ relative
 
             depth_units = depth_byte_to_unity_units(depth_byte, fcfg["near_clip"], fcfg["far_clip"])
-            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"])
+            mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"]) & all_border_masks[i]
             points_cam = backproject_depth(depth_units, fx, fy, cx, cy, y_down=fcfg["depth_axis_y_down"])
             points_cam_masked = points_cam[mask]
             colors = all_colors[i][mask]
@@ -789,7 +804,7 @@ def reconstruct_video(
               f"accepted={ba_result['accepted']} diagnostics={ba_result['diagnostics']}")
         if ba_result["accepted"]:
             pcd = rerun_fusion_with_corrected_poses(
-                all_depths, all_colors, all_valid, fused_original_poses, keyframe_fused_index,
+                all_depths, all_colors, all_valid, all_border_masks, fused_original_poses, keyframe_fused_index,
                 original_keyframe_poses, ba_result["poses"], fcfg, fx, fy, cx, cy,
             )
     elif bundle_adjust_enabled:

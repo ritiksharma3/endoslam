@@ -74,6 +74,12 @@ fusion:
                                         # pose chaining (no model-predicted equivalent exists for the
                                         # chain's starting pose) -- not supervision leakage, everything
                                         # inside the chain is still 100% model output.
+  border_min_brightness: 0.04  # real-video-only (reconstruct_video.py): pixels at or below this mean
+                                # RGB brightness in the *raw* (pre-DarkIR) frame are excluded from
+                                # backprojection entirely -- real endoscope footage has a solid black
+                                # circular vignette outside the lens's field of view (UnityCam's
+                                # synthetic frames have none), and those pixels' predicted depth is
+                                # noise that both looks bad and corrupts ICP/BA correspondence matching.
 
 eval:
   pose_metrics: ["ATE", "RPE"]

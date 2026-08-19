@@ -1,0 +1,16 @@
+{
+  "id": "ritiksharma8/endoslam-phase6-bundle-adjust",
+  "title": "endoslam-phase6-bundle-adjust",
+  "code_file": "phase6_bundle_adjust.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["ritiksharma8/endoslam-video1-sample"],
+  "competition_sources": [],
+  "kernel_sources": [
+    "ritiksharma8/endoslam-phase2-darkir-training",
+    "ritiksharma8/endoslam-phase3-mini3drecon-training"
+  ]
+}
