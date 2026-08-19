@@ -199,20 +199,27 @@ def build_tracks_from_correspondences(
 # at the conventional 6-per-camera.
 # ---------------------------------------------------------------------------
 
-def _pack_params(poses: np.ndarray, focal: float, landmarks: np.ndarray) -> np.ndarray:
+def _pack_params(poses: np.ndarray, focal: float, landmarks: np.ndarray, optimize_focal: bool) -> np.ndarray:
     cam_params = []
     for k in range(1, len(poses)):
         rotvec = Rotation.from_matrix(poses[k][:3, :3]).as_rotvec()
         cam_params.append(np.concatenate([rotvec, poses[k][:3, 3]]))
     cam_block = np.concatenate(cam_params) if cam_params else np.zeros(0)
-    return np.concatenate([cam_block, [focal], landmarks.reshape(-1)])
+    focal_part = [focal] if optimize_focal else []
+    return np.concatenate([cam_block, focal_part, landmarks.reshape(-1)])
 
 
-def _unpack_params(x: np.ndarray, n_cameras: int, n_landmarks: int) -> tuple[np.ndarray, float, np.ndarray]:
+def _unpack_params(
+    x: np.ndarray, n_cameras: int, n_landmarks: int, optimize_focal: bool, fixed_focal: float,
+) -> tuple[np.ndarray, float, np.ndarray]:
     n_free = n_cameras - 1
     cam_block = x[: n_free * 6].reshape(n_free, 6)
-    focal = float(x[n_free * 6])
-    landmarks = x[n_free * 6 + 1:].reshape(n_landmarks, 3)
+    if optimize_focal:
+        focal = float(x[n_free * 6])
+        landmarks = x[n_free * 6 + 1:].reshape(n_landmarks, 3)
+    else:
+        focal = fixed_focal
+        landmarks = x[n_free * 6:].reshape(n_landmarks, 3)
 
     poses = np.zeros((n_cameras, 4, 4))
     poses[0] = np.eye(4)
@@ -238,6 +245,8 @@ def _residuals(
     cy: float,
     target_arc_length: float,
     baseline_weight: float,
+    optimize_focal: bool,
+    fixed_focal: float,
 ) -> np.ndarray:
     """2 reprojection residuals per (camera, landmark) observation, plus one
     trailing gauge/scale-anchoring residual (technique #4): constrains the
@@ -245,8 +254,22 @@ def _residuals(
     pre-BA (ICP-chain) trajectory's own arc length. Pure reprojection-only BA
     is scale-ambiguous for a monocular camera -- without this, the optimizer
     is free to drift the whole reconstruction's scale while still driving
-    reprojection error to zero."""
-    poses, focal, landmarks = _unpack_params(x, n_cameras, n_landmarks)
+    reprojection error to zero. `baseline_weight` is expected to already be
+    scaled by the caller (refine_trajectory) to stay meaningful against
+    however many thousands of reprojection residuals exist -- a single
+    unscaled gauge residual is numerically negligible in a large problem
+    regardless of its own weight.
+
+    optimize_focal/fixed_focal: an earlier real-data evaluation
+    (src/eval/run_ba_comparison.py against UnityCam ground truth) found
+    jointly optimizing focal length alongside scale let BA find a much
+    lower reprojection cost in a materially *less accurate* scale regime
+    (trajectory_scale collapsed 0.64->0.12, rotation RPE roughly tripled) --
+    focal length and monocular depth scale are ambiguous together in a way
+    pose+landmark optimization alone isn't. Defaults to fixed_focal (no
+    self-calibration); optimize_focal=True is kept for experimentation, not
+    the recommended default."""
+    poses, focal, landmarks = _unpack_params(x, n_cameras, n_landmarks, optimize_focal, fixed_focal)
 
     cams = poses[camera_indices]
     R = cams[:, :3, :3]
@@ -267,11 +290,16 @@ def _residuals(
     return np.concatenate([reproj, gauge])
 
 
-def _build_sparsity(n_free_cams: int, n_landmarks: int, camera_indices: np.ndarray, landmark_indices: np.ndarray):
+def _build_sparsity(
+    n_free_cams: int, n_landmarks: int, camera_indices: np.ndarray, landmark_indices: np.ndarray,
+    optimize_focal: bool,
+):
     n_obs = len(camera_indices)
     n_residuals = n_obs * 2 + 1
-    n_params = n_free_cams * 6 + 1 + n_landmarks * 3
+    focal_cols = 1 if optimize_focal else 0
+    n_params = n_free_cams * 6 + focal_cols + n_landmarks * 3
     focal_col = n_free_cams * 6
+    landmarks_start = focal_col + focal_cols
     S = lil_matrix((n_residuals, n_params), dtype=bool)
 
     for obs_i in range(n_obs):
@@ -280,8 +308,9 @@ def _build_sparsity(n_free_cams: int, n_landmarks: int, camera_indices: np.ndarr
         if cam > 0:
             c0 = (cam - 1) * 6
             S[r0:r0 + 2, c0:c0 + 6] = True
-        S[r0:r0 + 2, focal_col] = True  # shared focal touches every observation
-        lc0 = focal_col + 1 + lm * 3
+        if optimize_focal:
+            S[r0:r0 + 2, focal_col] = True  # shared focal touches every observation
+        lc0 = landmarks_start + lm * 3
         S[r0:r0 + 2, lc0:lc0 + 3] = True
 
     for cam in range(1, n_free_cams + 1):  # gauge residual: every camera's translation block
@@ -330,11 +359,19 @@ def refine_trajectory(
     track_ids, camera_indices, point_indices = observations[:, 0], observations[:, 1], observations[:, 2]
     pixels = np.stack([keyframe_points_px[kf][pt] for kf, pt in zip(camera_indices, point_indices)])
 
+    optimize_focal = cfg.get("optimize_focal", False)
+    # A single gauge residual is numerically negligible against thousands of
+    # reprojection residuals regardless of its raw weight -- scale by
+    # sqrt(n_observations) so config.yaml's one default stays meaningful
+    # whether BA sees a 40-frame Video1.avi test (~6k observations) or a
+    # 155-frame UnityCam eval (~190k observations).
+    gauge_weight = cfg["baseline_anchor_weight"] * np.sqrt(len(observations))
+
     target_arc_length = float(np.sum(np.linalg.norm(np.diff(keyframe_poses[:, :3, 3], axis=0), axis=1)))
-    x0 = _pack_params(keyframe_poses, fx, landmark_init)
+    x0 = _pack_params(keyframe_poses, fx, landmark_init, optimize_focal)
     baseline_cost = 0.5 * float(np.sum(_residuals(
         x0, n_cameras, len(landmark_init), camera_indices, track_ids, pixels, cx, cy,
-        target_arc_length, cfg["baseline_anchor_weight"],
+        target_arc_length, gauge_weight, optimize_focal, fx,
     ) ** 2))
 
     best = {"x": x0, "cost": baseline_cost, "camera_indices": camera_indices, "track_ids": track_ids, "pixels": pixels}
@@ -342,12 +379,12 @@ def refine_trajectory(
     cur_cam_idx, cur_track_ids, cur_pixels = camera_indices, track_ids, pixels
 
     for _ in range(cfg.get("max_outer_iters", 3)):
-        sparsity = _build_sparsity(n_cameras - 1, n_landmarks, cur_cam_idx, cur_track_ids)
+        sparsity = _build_sparsity(n_cameras - 1, n_landmarks, cur_cam_idx, cur_track_ids, optimize_focal)
         result = least_squares(
             _residuals, best["x"], jac_sparsity=sparsity, method="trf", tr_solver="lsmr",
             loss=cfg["robust_loss"], f_scale=cfg["f_scale"], max_nfev=cfg["max_nfev"],
             args=(n_cameras, n_landmarks, cur_cam_idx, cur_track_ids, cur_pixels, cx, cy,
-                  target_arc_length, cfg["baseline_anchor_weight"]),
+                  target_arc_length, gauge_weight, optimize_focal, fx),
         )
         if result.cost >= best["cost"]:
             break  # no improvement this iteration -- keep best-known state (rollback)
@@ -357,14 +394,14 @@ def refine_trajectory(
         # Re-filter observations by current per-observation reprojection error
         # (MAD, technique #11) before the next outer iteration re-solves.
         resid = _residuals(result.x, n_cameras, n_landmarks, cur_cam_idx, cur_track_ids, cur_pixels,
-                            cx, cy, target_arc_length, cfg["baseline_anchor_weight"])
+                            cx, cy, target_arc_length, gauge_weight, optimize_focal, fx)
         per_obs_norm = np.linalg.norm(resid[:-1].reshape(-1, 2), axis=1)
         keep = mad_outlier_mask(per_obs_norm, cfg["mad_outlier_threshold"])
         if keep.all() or keep.sum() < 2:
             break
         cur_cam_idx, cur_track_ids, cur_pixels = cur_cam_idx[keep], cur_track_ids[keep], cur_pixels[keep]
 
-    poses, focal, landmarks = _unpack_params(best["x"], n_cameras, n_landmarks)
+    poses, focal, landmarks = _unpack_params(best["x"], n_cameras, n_landmarks, optimize_focal, fx)
     improvement = (baseline_cost - best["cost"]) / max(baseline_cost, 1e-12)
     accepted = improvement > cfg["rollback_min_improvement"]
 
@@ -376,6 +413,7 @@ def refine_trajectory(
         "diagnostics": {
             "baseline_cost": baseline_cost, "final_cost": best["cost"],
             "relative_improvement": improvement, "n_tracks": n_landmarks, "n_observations": len(observations),
+            "optimize_focal": optimize_focal, "gauge_weight": gauge_weight,
         },
     }
 

@@ -106,8 +106,19 @@ bundle_adjustment:
   max_nfev: 200                # TRF solver iteration cap per outer iteration, bounds Kaggle CPU runtime
   max_outer_iters: 3          # outer solve/re-filter iterations (bounded iterative optimization w/ rollback)
   mad_outlier_threshold: 3.5  # modified-z-score convention, observations beyond this get dropped between outer iters
-  baseline_anchor_weight: 1.0 # gauge/scale-anchoring residual weight (keeps BA's trajectory arc length
-                               # near the pre-BA ICP-chain's own, since reprojection-only BA is scale-ambiguous)
+  optimize_focal: false       # shared-focal self-calibration -- OFF by default. A real evaluation against
+                               # UnityCam ground truth (src/eval/run_ba_comparison.py) found optimizing focal
+                               # alongside scale let BA reach a much lower reprojection cost in a materially
+                               # LESS accurate scale regime (trajectory_scale collapsed 0.64->0.12, rotation
+                               # RPE roughly tripled 0.4deg->1.2deg) -- focal and monocular depth scale are
+                               # ambiguous together in a way pose+landmark optimization alone isn't. Kept as
+                               # an option for experimentation, not the recommended setting; re-run
+                               # run_ba_comparison.py against ground truth before ever re-enabling it.
+  baseline_anchor_weight: 1.0 # gauge/scale-anchoring residual weight, auto-scaled by sqrt(n_observations)
+                               # inside refine_trajectory() so this one default stays meaningful whether BA
+                               # sees a few thousand or a few hundred thousand reprojection residuals -- an
+                               # unscaled single gauge residual is numerically negligible against many
+                               # thousands of reprojection residuals regardless of its own raw weight.
   rollback_min_improvement: 0.01  # BA must beat the pre-BA ICP-chain cost by >1%, or its result is discarded
                                     # entirely and reconstruct_video()'s existing output is returned unchanged
   ransac_scale_shift:
