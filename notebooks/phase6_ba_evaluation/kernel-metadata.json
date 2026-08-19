@@ -1,0 +1,16 @@
+{
+  "id": "ritiksharma8/endoslam-phase6-ba-evaluation",
+  "title": "endoslam-phase6-ba-evaluation",
+  "code_file": "phase6_ba_evaluation.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["mcocoz/endoslam"],
+  "competition_sources": [],
+  "kernel_sources": [
+    "ritiksharma8/endoslam-phase2-darkir-training",
+    "ritiksharma8/endoslam-phase3-mini3drecon-training"
+  ]
+}

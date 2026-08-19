@@ -450,7 +450,7 @@ def rerun_fusion_with_corrected_poses(
     ba_keyframe_poses: np.ndarray,
     fcfg: dict,
     fx: float, fy: float, cx: float, cy: float,
-) -> o3d.geometry.PointCloud:
+) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
     """Re-runs backprojection + fusion (existing, unchanged pointcloud.py/
     backproject.py code) using bundle-adjustment-corrected keyframe poses.
     Every fused frame's corrected pose is obtained by rigidly re-anchoring it
@@ -459,11 +459,18 @@ def rerun_fusion_with_corrected_poses(
     i.e. BA's per-keyframe correction is propagated onto the frames around it
     via the *original* (already fine-grained-ICP-refined) relative motion
     between them, rather than interpolating a new one -- exact for every
-    fused frame, keyframe or not, no interpolation approximation needed."""
+    fused frame, keyframe or not, no interpolation approximation needed.
+
+    Returns (pcd, corrected_trajectory) -- the latter is every fused frame's
+    corrected absolute pose, (n_fused, 4, 4), used by
+    src/eval/run_ba_comparison.py to score bundle adjustment's actual effect
+    against ground truth (reconstruct_video()'s point cloud alone has no
+    trajectory to compare)."""
     corrections = [
         ba_keyframe_poses[k] @ np.linalg.inv(original_keyframe_poses[k])
         for k in range(len(original_keyframe_poses))
     ]
+    corrected_trajectory: list[np.ndarray] = []
 
     def frame_iter():
         fused_i = 0
@@ -474,6 +481,7 @@ def rerun_fusion_with_corrected_poses(
             while kf_ptr + 1 < len(keyframe_fused_index) and keyframe_fused_index[kf_ptr + 1] <= fused_i:
                 kf_ptr += 1
             corrected_pose = corrections[kf_ptr] @ fused_original_poses[fused_i]
+            corrected_trajectory.append(corrected_pose)
 
             depth_units = depth_byte_to_unity_units(all_depths[i], fcfg["near_clip"], fcfg["far_clip"])
             mask = apply_depth_trunc_mask(depth_units, fcfg["depth_trunc"]) & all_border_masks[i]
@@ -483,7 +491,8 @@ def rerun_fusion_with_corrected_poses(
             fused_i += 1
             yield points_world, colors
 
-    return accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
+    pcd = accumulate_point_cloud(frame_iter(), voxel_size=fcfg["voxel_downsample"])
+    return pcd, np.stack(corrected_trajectory)
 
 
 def save_reconstruction_checkpoint(
@@ -556,7 +565,8 @@ def reconstruct_video(
     checkpoint_every: int | None = None,
     resume: bool = False,
     bundle_adjust_enabled: bool = False,
-) -> o3d.geometry.PointCloud:
+    return_trajectory: bool = False,
+) -> o3d.geometry.PointCloud | tuple[o3d.geometry.PointCloud, np.ndarray]:
     """frames: (N,3,H,W) clean-or-dark [0,1] RGB (see load_video_frames).
     Runs DarkIR-lite -> Mini-3D-Recon per window (unchanged from before),
     then fuses **incrementally**: each frame's pose starts as a guess
@@ -606,7 +616,15 @@ def reconstruct_video(
     rerun_fusion_with_corrected_poses()) with the corrected poses; otherwise
     the ICP-chain-only result above is returned completely unchanged.
     NOTE: not resume-aware -- a resumed run's bundle adjustment only sees
-    keyframes captured during *this* invocation (a warning is printed)."""
+    keyframes captured during *this* invocation (a warning is printed).
+
+    return_trajectory: if True, also returns every fused frame's final
+    absolute pose as (n_fused, 4, 4) -- whichever pose actually produced the
+    returned point cloud (bundle-adjustment-corrected if it ran and was
+    accepted, the plain ICP-chain pose otherwise). The point cloud alone has
+    no per-frame trajectory to compare against ground truth, which
+    src/eval/run_ba_comparison.py needs to score bundle adjustment's actual
+    effect on pose accuracy, not just its effect on the fused shape."""
     fcfg = config["fusion"]
     ba_cfg = config.get("bundle_adjustment", {})  # only required when bundle_adjust_enabled=True
     H, W = tuple(config["data"]["image_size"])
@@ -794,6 +812,8 @@ def reconstruct_video(
         on_checkpoint=on_checkpoint if checkpoint_path else None,
     )
 
+    trajectory = np.stack(fused_original_poses) if fused_original_poses else np.zeros((0, 4, 4))
+
     if bundle_adjust_enabled and len(keyframe_points) >= 2:
         original_keyframe_poses = np.stack(keyframe_poses)
         ba_result = bundle_adjust.refine_trajectory(
@@ -803,14 +823,14 @@ def reconstruct_video(
         print(f"reconstruct_video: bundle adjustment over {len(keyframe_points)} keyframes -- "
               f"accepted={ba_result['accepted']} diagnostics={ba_result['diagnostics']}")
         if ba_result["accepted"]:
-            pcd = rerun_fusion_with_corrected_poses(
+            pcd, trajectory = rerun_fusion_with_corrected_poses(
                 all_depths, all_colors, all_valid, all_border_masks, fused_original_poses, keyframe_fused_index,
                 original_keyframe_poses, ba_result["poses"], fcfg, fx, fy, cx, cy,
             )
     elif bundle_adjust_enabled:
         print(f"reconstruct_video: bundle adjustment skipped -- only {len(keyframe_points)} keyframe(s) captured")
 
-    return pcd
+    return (pcd, trajectory) if return_trajectory else pcd
 
 
 def main():
